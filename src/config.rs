@@ -101,7 +101,7 @@ impl Default for Config {
                 data_dir: "data".into(),
                 segment_bytes: 1 << 30, // 1 GiB
                 shard_count: 64,
-                index_capacity: 1 << 21, // 2,097,152 slots
+                index_capacity: 1 << 30, // 1,073,741,824 slots (1 billion) - ~24GB RAM
                 sync_interval_ms: 200,
                 compaction_check_ms: 30000,
                 use_mmap_reads: false,
