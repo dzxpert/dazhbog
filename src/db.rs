@@ -42,13 +42,21 @@ impl Database {
     pub async fn push(&self, items: &[(u128, u32, u32, &str, &[u8])]) -> io::Result<Vec<u32>> {
         // status: 1 if new unique key, 0 if update (replace head)
         let mut status = Vec::with_capacity(items.len());
-        for (key, pop, len_bytes, name, data) in items.iter() {
+        for (key, pop, _len_bytes_decl, name, data) in items.iter() {
+            // Enforce invariants at ingestion; avoid any possibility of on-disk mismatch
+            if name.len() > u16::MAX as usize {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "name too long (> u16::MAX)"));
+            }
+            if data.len() > u32::MAX as usize {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "data too large (> u32::MAX)"));
+            }
+
             let old = self.rt.index.get(*key);
             let rec = Record {
                 key: *key,
                 ts_sec: crate::util::now_ts_sec(),
                 prev_addr: old,
-                len_bytes: *len_bytes,
+                len_bytes: (*data).len() as u32, // authoritative: actual data length
                 popularity: *pop,
                 name: name.to_string(),
                 data: data.to_vec(),

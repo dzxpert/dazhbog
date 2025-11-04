@@ -1,7 +1,8 @@
 use bytes::{BytesMut, BufMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use crate::codec::*;
 
+// Message codes (unchanged)
 pub const MSG_HELLO: u8 = 0x01;
 pub const MSG_HELLO_OK: u8 = 0x02;
 pub const MSG_FAIL: u8 = 0x03;
@@ -16,32 +17,7 @@ pub const MSG_HIST: u8 = 0x16;
 pub const MSG_HIST_OK: u8 = 0x17;
 
 #[derive(Debug)]
-pub struct HelloReq { pub protocol_version: u32, pub username: String, pub password: String }
-#[derive(Debug)]
-pub struct HelloOk { pub features: u32 }
-
-pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R, max: usize) -> std::io::Result<Vec<u8>> {
-    log::debug!("Starting read_frame, max allowed size: {}", max);
-    let mut lenbuf = [0u8; 4];
-    if let Err(e) = r.read_exact(&mut lenbuf).await {
-        log::debug!("Failed to read frame length: {}", e);
-        return Err(e);
-    }
-    // Wire protocol uses big-endian (network byte order) for length prefix
-    let len = u32::from_be_bytes(lenbuf) as usize;
-    log::debug!("Read frame length: {}", len);
-    if len > max {
-        log::debug!("Frame length {} exceeds maximum allowed {}", len, max);
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
-    }
-    let mut buf = vec![0u8; len];
-    if let Err(e) = r.read_exact(&mut buf).await {
-        log::debug!("Failed to read frame payload: {}", e);
-        return Err(e);
-    }
-    log::debug!("Successfully read frame payload of {} bytes", len);
-    Ok(buf)
-}
+pub struct HelloReq { pub protocol_version: u32, pub username: String, #[allow(dead_code)] pub password: String }
 
 pub async fn write_all<W: AsyncWriteExt + Unpin>(w: &mut W, buf: &[u8]) -> std::io::Result<()> {
     w.write_all(buf).await?;
@@ -87,11 +63,15 @@ pub fn encode_pull_ok(status: &[u32], funcs: &[(u32,u32,String,Vec<u8>)]) -> Byt
     frame(MSG_PULL_OK, &p)
 }
 
-pub fn decode_pull(payload: &[u8]) -> Result<Vec<u128>, CodecError> {
+// --- Explicit caps to avoid pre-allocation explosions ---
+
+pub fn decode_pull(payload: &[u8], max_items: usize) -> Result<Vec<u128>, CodecError> {
     let mut p = payload;
     if p.len() < 4 { return Err(CodecError::Short); }
     let n = u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize;
+    if n > max_items { return Err(CodecError::Malformed("pull count exceeds cap")); }
     p = &p[4..];
+    if p.len() < 16 * n { return Err(CodecError::Short); }
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(get_u128_le(&mut p)?);
@@ -100,21 +80,31 @@ pub fn decode_pull(payload: &[u8]) -> Result<Vec<u128>, CodecError> {
 }
 
 pub struct PushItem { pub key: u128, pub popularity: u32, pub len_bytes: u32, pub name: String, pub data: Vec<u8> }
-pub fn decode_push(payload: &[u8]) -> Result<Vec<PushItem>, CodecError> {
+
+pub struct PushCaps {
+    pub max_items: usize,
+    pub max_name_bytes: usize,
+    pub max_data_bytes: usize,
+}
+
+pub fn decode_push(payload: &[u8], caps: &PushCaps) -> Result<Vec<PushItem>, CodecError> {
     let mut p = payload;
     if p.len() < 4 { return Err(CodecError::Short); }
     let n = u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize;
+    if n > caps.max_items { return Err(CodecError::Malformed("push count exceeds cap")); }
     p = &p[4..];
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         let key = get_u128_le(&mut p)?;
         if p.len() < 8 { return Err(CodecError::Short); }
         let popularity = u32::from_le_bytes(p[0..4].try_into().unwrap());
-        let len_bytes = u32::from_le_bytes(p[4..8].try_into().unwrap());
+        let len_bytes_declared = u32::from_le_bytes(p[4..8].try_into().unwrap());
         p = &p[8..];
-        let name = get_str(&mut p)?;
-        let data = get_bytes(&mut p)?;
-        v.push(PushItem { key, popularity, len_bytes, name, data });
+        // bounded string/bytes
+        let name = get_str_max(&mut p, caps.max_name_bytes)?;
+        let data = get_bytes_max(&mut p, caps.max_data_bytes)?;
+        // len_bytes will be rigorously revalidated/normalized by DB & segment write path
+        v.push(PushItem { key, popularity, len_bytes: len_bytes_declared, name, data });
     }
     Ok(v)
 }
@@ -125,21 +115,24 @@ pub fn encode_push_ok(status: &[u32]) -> BytesMut {
     frame(MSG_PUSH_OK, &p)
 }
 
-pub fn decode_del(payload: &[u8]) -> Result<Vec<u128>, CodecError> {
-    decode_pull(payload)
+pub fn decode_del(payload: &[u8], max_items: usize) -> Result<Vec<u128>, CodecError> {
+    decode_pull(payload, max_items)
 }
+
 pub fn encode_del_ok(deleted: u32) -> BytesMut {
     let mut p = BytesMut::new();
     p.put_u32_le(deleted);
     frame(MSG_DEL_OK, &p)
 }
 
-pub fn decode_hist(payload: &[u8]) -> Result<(u32, Vec<u128>), CodecError> {
+pub fn decode_hist(payload: &[u8], max_items: usize) -> Result<(u32, Vec<u128>), CodecError> {
     let mut p = payload;
     if p.len() < 8 { return Err(CodecError::Short); }
     let limit = u32::from_le_bytes(p[0..4].try_into().unwrap());
     let n = u32::from_le_bytes(p[4..8].try_into().unwrap()) as usize;
+    if n > max_items { return Err(CodecError::Malformed("hist count exceeds cap")); }
     p = &p[8..];
+    if p.len() < 16 * n { return Err(CodecError::Short); }
     let mut v = Vec::with_capacity(n);
     for _ in 0..n { v.push(get_u128_le(&mut p)?); }
     Ok((limit, v))

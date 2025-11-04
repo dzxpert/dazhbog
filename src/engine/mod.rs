@@ -11,9 +11,11 @@ use std::{io, path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 pub struct EngineRuntime {
+    #[allow(dead_code)]
     pub dir: PathBuf,
     pub segments: Arc<OpenSegments>,
     pub index: Arc<ShardedIndex>,
+    #[allow(dead_code)]
     pub cfg: Engine,
 }
 

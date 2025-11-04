@@ -11,8 +11,6 @@ pub const fn pack_addr(seg_id: u16, offset: u64, flags: u8) -> u64 {
 pub const fn addr_seg(addr: u64) -> u16 { (addr >> 48) as u16 }
 #[inline]
 pub const fn addr_off(addr: u64) -> u64 { (addr >> 8) & ((1u64<<40)-1) }
-#[inline]
-pub const fn addr_flags(addr: u64) -> u8 { (addr & 0xFF) as u8 }
 
 #[inline]
 pub fn wyhash64(mut x: u64) -> u64 {

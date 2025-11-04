@@ -8,6 +8,26 @@ pub struct Limits {
     pub pull_timeout_ms: u64,
     pub push_timeout_ms: u64,
     pub max_active_conns: usize,
+    // --- Per-frame hard caps ---
+    // Maximum wire payload sizes (big-endian length field from the wire), in bytes.
+    // For the new protocol, the length INCLUDES the 1-byte message type.
+    // For the legacy protocol, the length EXCLUDES the 1-byte message type.
+    pub max_hello_frame_bytes: usize, // e.g., 4 MiB
+    pub max_cmd_frame_bytes: usize,   // e.g., 16 MiB
+    // --- Item-count & per-item caps (defend allocations before they happen) ---
+    pub max_pull_items: usize,
+    pub max_push_items: usize,
+    pub max_del_items: usize,
+    pub max_hist_items: usize,
+    // Per-item bytes caps
+    pub max_name_bytes: usize, // must be <= u16::MAX due to on-disk format
+    pub max_data_bytes: usize, // per function metadata payload
+    // --- In-flight memory budgets ---
+    pub per_connection_inflight_bytes: usize, // soft limit per connection for frame buffers
+    pub global_inflight_bytes: usize,         // node-wide limit for all connections
+    // --- Legacy parser safety caps ---
+    pub legacy_max_cstr_bytes: usize, // cap for C-strings in legacy messages (paths, hostnames)
+    pub legacy_max_hash_bytes: usize, // cap for variable-length "mb_hash" (should be small; 16 is expected)
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +81,19 @@ impl Default for Config {
                 pull_timeout_ms: 15000,
                 push_timeout_ms: 15000,
                 max_active_conns: 2048,
+                // Defaults (balanced for safety with compatibility):
+                max_hello_frame_bytes: 4 * 1024 * 1024,  // 4 MiB
+                max_cmd_frame_bytes: 16 * 1024 * 1024,   // 16 MiB
+                max_pull_items: 16384,
+                max_push_items: 8192,
+                max_del_items: 16384,
+                max_hist_items: 4096,
+                max_name_bytes: 65535,       // u16::MAX; required by on-disk format
+                max_data_bytes: 8 * 1024 * 1024, // 8 MiB per item
+                per_connection_inflight_bytes: 32 * 1024 * 1024, // 32 MiB
+                global_inflight_bytes: 512 * 1024 * 1024,        // 512 MiB
+                legacy_max_cstr_bytes: 4096, // 4 KiB cap for C-strings (paths, hostnames)
+                legacy_max_hash_bytes: 64,   // hashes expected 16 bytes; allow small slack
             },
             http: Some(Http { bind_addr: "127.0.0.1:8080".into() }),
             engine: Engine {
@@ -116,6 +149,19 @@ impl Config {
                     ("limits","pull_timeout_ms") => cfg.limits.pull_timeout_ms = parse!(u),
                     ("limits","push_timeout_ms") => cfg.limits.push_timeout_ms = parse!(u),
                     ("limits","max_active_conns") => cfg.limits.max_active_conns = parse!(usize_),
+                    // Additional limits:
+                    ("limits","max_hello_frame_bytes") => cfg.limits.max_hello_frame_bytes = parse!(usize_),
+                    ("limits","max_cmd_frame_bytes") => cfg.limits.max_cmd_frame_bytes = parse!(usize_),
+                    ("limits","max_pull_items") => cfg.limits.max_pull_items = parse!(usize_),
+                    ("limits","max_push_items") => cfg.limits.max_push_items = parse!(usize_),
+                    ("limits","max_del_items") => cfg.limits.max_del_items = parse!(usize_),
+                    ("limits","max_hist_items") => cfg.limits.max_hist_items = parse!(usize_),
+                    ("limits","max_name_bytes") => cfg.limits.max_name_bytes = parse!(usize_),
+                    ("limits","max_data_bytes") => cfg.limits.max_data_bytes = parse!(usize_),
+                    ("limits","per_connection_inflight_bytes") => cfg.limits.per_connection_inflight_bytes = parse!(usize_),
+                    ("limits","global_inflight_bytes") => cfg.limits.global_inflight_bytes = parse!(usize_),
+                    ("limits","legacy_max_cstr_bytes") => cfg.limits.legacy_max_cstr_bytes = parse!(usize_),
+                    ("limits","legacy_max_hash_bytes") => cfg.limits.legacy_max_hash_bytes = parse!(usize_),
 
                     ("http","bind_addr") => { cfg.http.get_or_insert_with(|| super::config::Http { bind_addr: "".into() }).bind_addr = parse!(s); },
 
@@ -148,4 +194,3 @@ impl Config {
         Ok(cfg)
     }
 }
-

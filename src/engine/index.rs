@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::spin::SpinLock;
 use crate::util::key_tag;
+use crate::metrics::METRICS;
 
 #[derive(Debug)]
 pub struct Slot {
@@ -78,9 +79,10 @@ impl ShardedIndex {
             }
             idx = (idx + 1) & mask;
         }
-        // Should not happen with safe load factor; last resort overwrite
-        let old = slots[idx].addr.swap(addr, Ordering::AcqRel);
-        Some(old)
+        // --- CHANGED: do NOT overwrite arbitrary slot; signal overflow ---
+        METRICS.index_overflows.fetch_add(1, Ordering::Relaxed);
+        log::error!("ShardedIndex overflow on shard {}; refusing to overwrite existing entry", sidx);
+        None
     }
 
     pub fn delete(&self, key: u128) -> Option<u64> {

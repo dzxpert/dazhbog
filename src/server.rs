@@ -5,16 +5,131 @@ use tokio::{
     net::TcpListener,
     time::timeout,
 };
-use tokio::io::AsyncReadExt as _; // for TcpStream::peek
+use tokio::io::AsyncReadExt;
+
+// ---- In-flight budgeting primitives (per-connection and global) ----
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Budget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl Budget {
+    fn new(limit: usize) -> Self { Self { limit, used: AtomicUsize::new(0) } }
+
+    fn try_reserve(self: &Arc<Self>, n: usize) -> Option<BudgetGuard> {
+        loop {
+            let cur = self.used.load(Ordering::Relaxed);
+            let new = cur.checked_add(n)?;
+            if new > self.limit { return None; }
+            if self.used.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return Some(BudgetGuard { b: Arc::clone(self), n });
+            }
+        }
+    }
+
+    fn release(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+struct BudgetGuard {
+    b: Arc<Budget>,
+    n: usize,
+}
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        self.b.release(self.n);
+    }
+}
+
+struct OwnedFrame {
+    buf: Vec<u8>,
+    _conn: BudgetGuard,
+    _global: BudgetGuard,
+}
+
+impl OwnedFrame {
+    fn as_slice(&self) -> &[u8] { &self.buf }
+}
+
+// Multi-protocol bounded reader.
+//
+// Wire length L semantics:
+//   - New protocol: L = 1 (type) + payload_len.
+//   - Legacy protocol: L = payload_len (type byte is *separate* on wire).
+//
+// This reader always returns a buffer beginning with the message type byte,
+// followed by payload bytes, i.e. [type | payload...].
+async fn read_multiproto_bounded<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    is_legacy: Option<bool>, // None during hello; Some(true/false) otherwise
+    max_len_field: usize,    // max allowed wire length L
+    conn_budget: &Arc<Budget>,
+    global_budget: &Arc<Budget>,
+) -> io::Result<OwnedFrame> {
+    let mut head = [0u8; 5];
+
+    // read 4B wire length first
+    r.read_exact(&mut head[..4]).await?;
+    let len_field = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+
+    if len_field > max_len_field {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    }
+
+    // read the message type byte
+    r.read_exact(&mut head[4..5]).await?;
+    let typ = head[4];
+
+    // determine payload_to_read based on protocol
+    let is_legacy_final = if let Some(b) = is_legacy {
+        b
+    } else {
+        // during hello: infer from the code
+        // legacy hello uses 0x0d; new hello uses 0x01
+        typ == 0x0d
+    };
+
+    let to_read_payload = if is_legacy_final {
+        // legacy: len_field is payload length (excludes type)
+        len_field
+    } else {
+        // new: len_field includes the 1-byte type
+        if len_field == 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid length")); }
+        len_field - 1
+    };
+
+    // total buffer we will hold in memory for this frame
+    let total_buf = 1usize.checked_add(to_read_payload).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "length overflow"))?;
+
+    // reserve budgets BEFORE allocation and read
+    let g1 = conn_budget.clone().try_reserve(total_buf).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "per-connection memory budget exceeded"))?;
+    let g2 = global_budget.clone().try_reserve(total_buf).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "global memory budget exceeded"))?;
+
+    let mut data = vec![0u8; total_buf];
+    data[0] = typ;
+    r.read_exact(&mut data[1..]).await?;
+
+    Ok(OwnedFrame { buf: data, _conn: g1, _global: g2 })
+}
 
 async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut stream: S,
     cfg: Arc<Config>,
     db: Arc<Database>,
+    global_budget: Arc<Budget>,
 ) -> io::Result<()> {
-    // Hello - peek first to detect protocol type, then read with appropriate reader
-    // For legacy protocol, we need to use read_legacy_packet from the start
-    let hello_bytes = match timeout(Duration::from_millis(cfg.limits.hello_timeout_ms), legacy::read_legacy_packet(&mut stream, 4*1024*1024)).await {
+    let conn_budget = Arc::new(Budget::new(cfg.limits.per_connection_inflight_bytes));
+
+    // --- Hello: read in multi-protocol mode with hello limits ---
+    let hello_frame = match timeout(
+        Duration::from_millis(cfg.limits.hello_timeout_ms),
+        read_multiproto_bounded(&mut stream, None, cfg.limits.max_hello_frame_bytes, &conn_budget, &global_budget)
+    ).await {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -22,70 +137,63 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             return Ok(());
         }
     };
+
+    let hello_bytes = hello_frame.as_slice();
     debug!("Received hello message, {} bytes", hello_bytes.len());
+
     if log_enabled!(log::Level::Debug) {
-        debug!("Hello frame hex dump:\n{}", hex_dump(&hello_bytes, 256));
+        debug!("Hello frame hex dump:\n{}", hex_dump(hello_bytes, 256));
     }
+
     if hello_bytes.is_empty() {
         write_all(&mut stream, &encode_fail(0, "bad sequence")).await?;
         return Ok(());
     }
+
     let msg_type = hello_bytes[0];
     let payload = &hello_bytes[1..];
-    
-    // Handle both legacy (0x0d) and new (0x01) protocol
+
     const LEGACY_MSG_HELLO: u8 = 0x0d;
-    let hello = if msg_type == LEGACY_MSG_HELLO {
-        // Legacy protocol from lumen-master / IDA Pro
+    let is_legacy = msg_type == LEGACY_MSG_HELLO;
+
+    // Parse hello according to protocol
+    let hello = if is_legacy {
         debug!("Detected legacy Hello message (0x0d)");
         match legacy::parse_legacy_hello(payload) {
-            Ok(v) => {
-                debug!("Legacy Hello parsed: protocol_version={}, username={}", v.protocol_version, v.username);
-                HelloReq {
-                    protocol_version: v.protocol_version,
-                    username: v.username,
-                    password: v.password,
-                }
-            },
-            Err(e) => {
-                error!("Failed to parse legacy Hello: {}", e);
-                write_all(&mut stream, &encode_fail(0, "invalid hello")).await?;
-                return Ok(());
-            }
+            Ok(v) => HelloReq { protocol_version: v.protocol_version, username: v.username, password: v.password },
+            Err(e) => { error!("Failed to parse legacy Hello: {}", e); write_all(&mut stream, &encode_fail(0, "invalid hello")).await?; return Ok(()); }
         }
     } else if msg_type == MSG_HELLO {
-        // New protocol
         debug!("Detected new Hello message (0x01)");
         match decode_hello(payload) {
             Ok(v) => v,
-            Err(_) => {
-                write_all(&mut stream, &encode_fail(0, "invalid hello")).await?;
-                return Ok(());
-            }
+            Err(_) => { write_all(&mut stream, &encode_fail(0, "invalid hello")).await?; return Ok(()); }
         }
     } else {
         error!("Unknown Hello message type: 0x{:02x}", msg_type);
         write_all(&mut stream, &encode_fail(0, "bad sequence")).await?;
         return Ok(());
     };
+
     debug!("Hello request: protocol_version={}, username={}", hello.protocol_version, hello.username);
+
     if hello.protocol_version <= 4 {
         METRICS.lumina_v0_4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
         METRICS.lumina_v5p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+
     if hello.username != "guest" {
-        if msg_type == LEGACY_MSG_HELLO {
+        if is_legacy {
             legacy::send_legacy_fail(&mut stream, 1, &format!("{}: invalid username or password. Try logging in with `guest` instead.", cfg.lumina.server_name)).await?;
         } else {
             write_all(&mut stream, &encode_fail(1, &format!("{}: invalid username or password. Try logging in with `guest` instead.", cfg.lumina.server_name))).await?;
         }
         return Ok(());
     }
+
     // Protocol split: ≤4 expects empty OK; ≥5 expects HelloResult{features}
-    if msg_type == LEGACY_MSG_HELLO {
-        // Legacy client - send legacy format responses
-        debug!("Sending legacy protocol response");
+    if is_legacy {
         if hello.protocol_version <= 4 {
             legacy::send_legacy_ok(&mut stream).await?;
         } else {
@@ -94,7 +202,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             legacy::send_legacy_hello_result(&mut stream, features).await?;
         }
     } else {
-        // New protocol client
         if hello.protocol_version <= 4 {
             write_all(&mut stream, &encode_ok()).await?;
         } else {
@@ -104,11 +211,13 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         }
     }
 
-    // Command loop - use appropriate frame reader based on protocol
-    let is_legacy = msg_type == LEGACY_MSG_HELLO;
+    // --- Command loop: budgeted frame reads with command caps ---
     loop {
         let frame = if is_legacy {
-            match timeout(Duration::from_millis(cfg.limits.command_timeout_ms), legacy::read_legacy_packet(&mut stream, 128*1024*1024)).await {
+            match timeout(
+                Duration::from_millis(cfg.limits.command_timeout_ms),
+                read_multiproto_bounded(&mut stream, Some(true), cfg.limits.max_cmd_frame_bytes, &conn_budget, &global_budget)
+            ).await {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Ok(Err(e)) => { error!("read error: {}", e); return Ok(()); },
@@ -119,7 +228,10 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 }
             }
         } else {
-            match timeout(Duration::from_millis(cfg.limits.command_timeout_ms), read_frame(&mut stream, 128*1024*1024)).await {
+            match timeout(
+                Duration::from_millis(cfg.limits.command_timeout_ms),
+                read_multiproto_bounded(&mut stream, Some(false), cfg.limits.max_cmd_frame_bytes, &conn_budget, &global_budget)
+            ).await {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Ok(Err(e)) => { error!("read error: {}", e); return Ok(()); },
@@ -130,7 +242,10 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 }
             }
         };
-        if frame.is_empty() {
+
+        let frame_bytes = frame.as_slice();
+
+        if frame_bytes.is_empty() {
             if is_legacy {
                 legacy::send_legacy_fail(&mut stream, 0, &format!("{}: error: invalid data.\n", cfg.lumina.server_name)).await?;
             } else {
@@ -138,16 +253,27 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             }
             continue;
         }
-        let typ = frame[0];
-        let pld = &frame[1..];
+
+        let typ = frame_bytes[0];
+        let pld = &frame_bytes[1..];
+
         debug!("Incoming message: type=0x{:02x}, payload_size={}", typ, pld.len());
-        
-        // Handle legacy protocol commands
+
         if is_legacy {
+            // --- Legacy command handling with caps ---
             debug!("Legacy command received: 0x{:02x}", typ);
+
             match typ {
                 0x0e => { // PullMetadata
-                    let pull_msg = match legacy::parse_legacy_pull_metadata(pld) {
+                    let caps = legacy::LegacyCaps {
+                        max_funcs: cfg.limits.max_pull_items,
+                        max_name_bytes: cfg.limits.max_name_bytes,
+                        max_data_bytes: cfg.limits.max_data_bytes,
+                        max_cstr_bytes: cfg.limits.legacy_max_cstr_bytes,
+                        max_hash_bytes: cfg.limits.legacy_max_hash_bytes,
+                    };
+
+                    let pull_msg = match legacy::parse_legacy_pull_metadata(pld, caps) {
                         Ok(v) => v,
                         Err(e) => {
                             error!("Failed to parse legacy PullMetadata: {}", e);
@@ -155,6 +281,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             continue;
                         }
                     };
+
                     debug!("Legacy PULL request: {} keys", pull_msg.funcs.len());
                     METRICS.queried_funcs.fetch_add(pull_msg.funcs.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     
@@ -162,7 +289,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     let mut found = Vec::new();
                     
                     for func in &pull_msg.funcs {
-                        // Convert 16-byte hash to u128 key
                         if func.mb_hash.len() != 16 {
                             statuses.push(1);
                             continue;
@@ -180,10 +306,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                                 found.push((f.popularity, f.len_bytes, f.name, f.data));
                             },
                             Ok(None) => { statuses.push(1); },
-                            Err(e) => {
-                                error!("db pull: {}", e);
-                                statuses.push(1);
-                            }
+                            Err(e) => { error!("db pull: {}", e); statuses.push(1); }
                         }
                     }
                     
@@ -192,7 +315,15 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     legacy::send_legacy_pull_result(&mut stream, &statuses, &found).await?;
                 },
                 0x10 => { // PushMetadata
-                    let push_msg = match legacy::parse_legacy_push_metadata(pld) {
+                    let caps = legacy::LegacyCaps {
+                        max_funcs: cfg.limits.max_push_items,
+                        max_name_bytes: cfg.limits.max_name_bytes,
+                        max_data_bytes: cfg.limits.max_data_bytes,
+                        max_cstr_bytes: cfg.limits.legacy_max_cstr_bytes,
+                        max_hash_bytes: cfg.limits.legacy_max_hash_bytes,
+                    };
+
+                    let push_msg = match legacy::parse_legacy_push_metadata(pld, caps) {
                         Ok(v) => v,
                         Err(e) => {
                             error!("Failed to parse legacy PushMetadata: {}", e);
@@ -200,11 +331,11 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             continue;
                         }
                     };
+
                     debug!("Legacy PUSH request: {} items", push_msg.funcs.len());
                     
                     let mut inlined: Vec<(u128, u32, u32, &str, &[u8])> = Vec::with_capacity(push_msg.funcs.len());
                     for func in &push_msg.funcs {
-                        // Convert 16-byte hash to u128 key
                         if func.hash.len() != 16 {
                             error!("Invalid hash length: {}", func.hash.len());
                             continue;
@@ -237,12 +368,19 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         legacy::send_legacy_fail(&mut stream, 2, &format!("{}: Delete command is disabled on this server.", cfg.lumina.server_name)).await?;
                         continue;
                     }
-                    // For now, just return success with 0 deleted
                     debug!("Legacy DEL request (not fully implemented)");
                     legacy::send_legacy_del_result(&mut stream, 0).await?;
                 },
                 0x2f => { // GetFuncHistories
-                    let hist_msg = match legacy::parse_legacy_get_func_histories(pld) {
+                    let caps = legacy::LegacyCaps {
+                        max_funcs: cfg.limits.max_hist_items,
+                        max_name_bytes: cfg.limits.max_name_bytes,
+                        max_data_bytes: cfg.limits.max_data_bytes,
+                        max_cstr_bytes: cfg.limits.legacy_max_cstr_bytes,
+                        max_hash_bytes: cfg.limits.legacy_max_hash_bytes,
+                    };
+
+                    let hist_msg = match legacy::parse_legacy_get_func_histories(pld, caps) {
                         Ok(v) => v,
                         Err(e) => {
                             error!("Failed to parse legacy GetFuncHistories: {}", e);
@@ -250,6 +388,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             continue;
                         }
                     };
+
                     debug!("Legacy HIST request: {} keys", hist_msg.funcs.len());
                     
                     let limit = if cfg.lumina.get_history_limit == 0 { 0 } else { cfg.lumina.get_history_limit };
@@ -299,28 +438,25 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     continue;
                 }
             }
-            continue; // Process next command
+            continue;
         }
-        
-        // New protocol commands
+
+        // --- New protocol commands ---
         let msg_start = Instant::now();
+
         match typ {
             MSG_PULL => {
-                let keys = match decode_pull(pld) { Ok(v) => v, Err(_) => {
+                let keys = match decode_pull(pld, cfg.limits.max_pull_items) { Ok(v) => v, Err(e) => {
+                    error!("decode_pull: {:?}", e);
                     write_all(&mut stream, &encode_fail(0, "invalid pull")).await?; continue;
                 }};
+
                 debug!("PULL request: {} keys", keys.len());
-                if log_enabled!(log::Level::Debug) {
-                    for (i, key) in keys.iter().enumerate().take(10) {
-                        debug!("  Key[{}]: 0x{:032x}", i, key);
-                    }
-                    if keys.len() > 10 {
-                        debug!("  ... and {} more keys", keys.len() - 10);
-                    }
-                }
                 METRICS.queried_funcs.fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
                 let mut statuses = Vec::with_capacity(keys.len());
                 let mut found = Vec::new();
+
                 for k in keys {
                     match db.get_latest(k).await {
                         Ok(Some(f)) => {
@@ -331,15 +467,25 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         Err(e) => { error!("db pull: {}", e); statuses.push(1); }
                     }
                 }
+
                 METRICS.pulls.fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 debug!("PULL response: {} found, {} not found (took {:?})", found.len(), statuses.iter().filter(|&&s| s == 1).count(), msg_start.elapsed());
                 write_all(&mut stream, &encode_pull_ok(&statuses, &found)).await?;
             },
             MSG_PUSH => {
-                let items = match decode_push(pld) { Ok(v) => v, Err(_) => {
+                let caps = PushCaps {
+                    max_items: cfg.limits.max_push_items,
+                    max_name_bytes: cfg.limits.max_name_bytes,
+                    max_data_bytes: cfg.limits.max_data_bytes,
+                };
+
+                let items = match decode_push(pld, &caps) { Ok(v) => v, Err(e) => {
+                    error!("decode_push: {:?}", e);
                     write_all(&mut stream, &encode_fail(0, "invalid push")).await?; continue;
                 }};
+
                 debug!("PUSH request: {} items", items.len());
+
                 if log_enabled!(log::Level::Debug) {
                     for (i, item) in items.iter().enumerate().take(5) {
                         debug!("  Item[{}]: key=0x{:032x}, pop={}, len={}, name='{}'", 
@@ -350,11 +496,14 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         debug!("  ... and {} more items", items.len() - 5);
                     }
                 }
+
                 let mut inlined: Vec<(u128,u32,u32,&str,&[u8])> = Vec::with_capacity(items.len());
                 for it in &items {
                     inlined.push((it.key, it.popularity, it.len_bytes, &it.name, &it.data));
                 }
+
                 let res = db.push(&inlined).await;
+
                 match res {
                     Ok(status) => {
                         let new_funcs = status.iter().filter(|&&v| v>0).count() as u64;
@@ -375,18 +524,14 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     write_all(&mut stream, &encode_fail(2, &format!("{}: Delete command is disabled on this server.", cfg.lumina.server_name))).await?;
                     continue;
                 }
-                let keys = match decode_del(pld) { Ok(v) => v, Err(_) => {
+
+                let keys = match decode_del(pld, cfg.limits.max_del_items) { Ok(v) => v, Err(e) => {
+                    error!("decode_del: {:?}", e);
                     write_all(&mut stream, &encode_fail(0, "invalid del")).await?; continue;
                 }};
+
                 debug!("DEL request: {} keys", keys.len());
-                if log_enabled!(log::Level::Debug) {
-                    for (i, key) in keys.iter().enumerate().take(10) {
-                        debug!("  Key[{}]: 0x{:032x}", i, key);
-                    }
-                    if keys.len() > 10 {
-                        debug!("  ... and {} more keys", keys.len() - 10);
-                    }
-                }
+
                 match db.delete_keys(&keys).await {
                     Ok(n) => { 
                         debug!("DEL response: {} keys deleted (took {:?})", n, msg_start.elapsed());
@@ -399,25 +544,22 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 }
             },
             MSG_HIST => {
-                let (limit_req, keys) = match decode_hist(pld) { Ok(v) => v, Err(_) => {
+                let (limit_req, keys) = match decode_hist(pld, cfg.limits.max_hist_items) { Ok(v) => v, Err(e) => {
+                    error!("decode_hist: {:?}", e);
                     write_all(&mut stream, &encode_fail(0, "invalid hist")).await?; continue;
                 }};
+
                 debug!("HIST request: limit={}, {} keys", limit_req, keys.len());
-                if log_enabled!(log::Level::Debug) {
-                    for (i, key) in keys.iter().enumerate().take(10) {
-                        debug!("  Key[{}]: 0x{:032x}", i, key);
-                    }
-                    if keys.len() > 10 {
-                        debug!("  ... and {} more keys", keys.len() - 10);
-                    }
-                }
+
                 let limit = if cfg.lumina.get_history_limit == 0 { 0 } else { cfg.lumina.get_history_limit.min(limit_req) };
                 if limit == 0 {
                     write_all(&mut stream, &encode_fail(4, &format!("{}: function histories are disabled on this server.", cfg.lumina.server_name))).await?;
                     continue;
                 }
+
                 let mut statuses = Vec::with_capacity(keys.len());
                 let mut logs = Vec::new();
+
                 for k in keys {
                     match db.get_history(k, limit).await {
                         Ok(v) if !v.is_empty() => { statuses.push(1); logs.push(v); },
@@ -429,6 +571,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         }
                     }
                 }
+
                 let found_histories = logs.len();
                 debug!("HIST response: {} histories found (took {:?})", found_histories, msg_start.elapsed());
                 write_all(&mut stream, &encode_hist_ok(&statuses, &logs)).await?;
@@ -461,6 +604,10 @@ fn looks_like_tls_client_hello(hdr6: &[u8]) -> bool {
 
 pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
     let listener = TcpListener::bind(&cfg.lumina.bind_addr).await.expect("bind failed");
+
+    // construct global budget once per listener
+    let global_budget = Arc::new(Budget::new(cfg.limits.global_inflight_bytes));
+
     let mut tls_acceptor = None;
     if cfg.lumina.use_tls {
         let tls = cfg.lumina.tls.as_ref().expect("tls config missing");
@@ -468,13 +615,16 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
         let pass = std::env::var(&tls.env_password_var).unwrap_or_default();
         let id = native_tls::Identity::from_pkcs12(&crt, &pass).expect("parse pkcs12");
         crt.iter_mut().for_each(|b| *b = 0); // zeroize
+
         let mut builder = native_tls::TlsAcceptor::builder(id);
         if tls.min_protocol_sslv3 {
+            // *** Retained per request (IDA Pro requirement) ***
             builder.min_protocol_version(Some(native_tls::Protocol::Sslv3));
         }
         let acc = builder.build().expect("tls build");
         tls_acceptor = Some(tokio_native_tls::TlsAcceptor::from(acc));
     }
+
     info!("binary RPC listening on {} secure={}", listener.local_addr().unwrap(), tls_acceptor.is_some());
 
     loop {
@@ -482,19 +632,23 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
             Ok(v) => v,
             Err(e) => { error!("accept: {}", e); continue; }
         };
+
         if METRICS.active_connections.load(std::sync::atomic::Ordering::Relaxed) as usize >= cfg.limits.max_active_conns {
             debug!("refusing connection {}; too many", addr);
             drop(socket);
             continue;
         }
+
         METRICS.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let cfg = cfg.clone();
         let db = db.clone();
         let acceptor = tls_acceptor.clone();
+        let global_budget = global_budget.clone();
 
         tokio::spawn(async move {
             debug!("New connection from {}", addr);
+
             let res = if let Some(acc) = acceptor {
                 // TLS is enabled in config: sniff first bytes and choose TLS vs cleartext.
                 let sniff_deadline = Duration::from_millis(cfg.limits.tls_handshake_timeout_ms);
@@ -517,24 +671,26 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
                     match tokio::time::timeout(Duration::from_millis(cfg.limits.tls_handshake_timeout_ms), acc.accept(socket)).await {
                         Ok(Ok(s)) => {
                             debug!("TLS handshake completed for {}", addr);
-                            handle_client(s, cfg, db).await
+                            handle_client(s, cfg, db, global_budget).await
                         },
                         Ok(Err(e)) => { debug!("tls accept {}: {}", addr, e); Ok(()) },
                         Err(_) => { debug!("tls handshake timeout {}", addr); Ok(()) },
                     }
                 } else {
                     debug!("{}: cleartext detected; proceeding without TLS", addr);
-                    handle_client(socket, cfg, db).await
+                    handle_client(socket, cfg, db, global_budget).await
                 }
             } else {
                 // TLS disabled in config → cleartext only.
-                handle_client(socket, cfg, db).await
+                handle_client(socket, cfg, db, global_budget).await
             };
+
             if let Err(e) = res { 
                 debug!("connection {} ended: {}", addr, e); 
             } else {
                 debug!("connection {} closed cleanly", addr);
             }
+
             METRICS.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }

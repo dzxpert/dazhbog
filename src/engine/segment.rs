@@ -36,6 +36,7 @@ pub struct OpenSegments {
     dir: PathBuf,
     pub current: std::sync::Mutex<SegmentWriter>,
     pub readers: parking_lot::Mutex<Vec<SegmentReader>>,
+    #[allow(dead_code)]
     pub use_mmap: bool, // currently unused; retained for future optimization
     pub seg_bytes: u64,
 }
@@ -48,24 +49,37 @@ impl SegmentWriter {
         Ok(Self { file, id, cap, off })
     }
 
-    pub fn remaining(&self) -> u64 { self.cap - self.off }
-
     pub fn append(&mut self, rec: &Record) -> io::Result<Addr> {
+        // --- STRONG INVARIANTS ---
+        // 1) name length must fit in u16 (on-disk format)
+        if rec.name.len() > u16::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "record.name too long (> u16::MAX)"));
+        }
+        // 2) declared len_bytes must match actual data length
+        if rec.len_bytes as usize != rec.data.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "record.len_bytes mismatch with data length"));
+        }
+
         let name_len = rec.name.len() as u16;
         let data_len = rec.data.len() as u32;
+
+        // Body layout size (in bytes); keep in sync with reader
         let body_len: usize = 8+8+8+8+4+4+2+4+1+5 + (name_len as usize) + (data_len as usize);
         let total_len = 4 + 4 + 4 + body_len; // magic + rec_len + crc + body
+
         if self.off + (total_len as u64) > self.cap {
             return Err(io::Error::new(io::ErrorKind::Other, "segment full"));
         }
+
         let mut buf = Vec::with_capacity(total_len);
         let rec_len = total_len as u32;
+
         // header placeholders
         buf.extend_from_slice(&MAGIC.to_le_bytes());
         buf.extend_from_slice(&rec_len.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
 
-        // body
+        // body (LE)
         buf.extend_from_slice(&(rec.key as u64).to_le_bytes());
         buf.extend_from_slice(&((rec.key >> 64) as u64).to_le_bytes());
         buf.extend_from_slice(&rec.ts_sec.to_le_bytes());
@@ -78,6 +92,7 @@ impl SegmentWriter {
         buf.extend_from_slice(&[0u8;5]); // pad to 8
         buf.extend_from_slice(rec.name.as_bytes());
         buf.extend_from_slice(&rec.data);
+
         // crc over body
         let crc = crc32c(0, &buf[12..]);
         buf[8..12].copy_from_slice(&crc.to_le_bytes());
@@ -131,6 +146,12 @@ impl SegmentReader {
         let name = std::str::from_utf8(&p[name_start .. name_start+name_len]).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8"))?.to_string();
         let data_start = name_start + name_len;
         let data = p[data_start .. data_start+data_len].to_vec();
+
+        // Additional invariant check on read
+        if data_len != len_bytes as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "len_bytes/data_len mismatch on disk"));
+        }
+
         Ok(Record { key, ts_sec, prev_addr, len_bytes, popularity, name, data, flags })
     }
 }
