@@ -83,8 +83,8 @@ impl Default for Config {
                 push_timeout_ms: 15000,
                 max_active_conns: 2048,
                 // Defaults (balanced for safety with compatibility):
-                max_hello_frame_bytes: 4 * 1024 * 1024,  // 4 MiB
-                max_cmd_frame_bytes: 16 * 1024 * 1024,   // 16 MiB
+                max_hello_frame_bytes: 16 * 1024 * 1024,  // 16 MiB
+                max_cmd_frame_bytes: 256 * 1024 * 1024,   // 256 MiB
                 max_pull_items: 524288,  // 512k items
                 max_push_items: 524288,  // 512k items - handle very large binaries
                 max_del_items: 524288,   // 512k items
@@ -101,7 +101,7 @@ impl Default for Config {
                 data_dir: "data".into(),
                 segment_bytes: 1 << 30, // 1 GiB
                 shard_count: 64,
-                index_capacity: 1 << 30, // 1,073,741,824 slots (1 billion) - ~24GB RAM
+                index_capacity: 1 << 30, // 1,073,741,824 slots (1 billion) - ~16GB RAM
                 sync_interval_ms: 200,
                 compaction_check_ms: 30000,
                 use_mmap_reads: false,
