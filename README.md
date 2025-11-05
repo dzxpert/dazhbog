@@ -30,10 +30,8 @@ cargo build --release
 # Start the server
 ./dazhbog config.toml
 
-# Configure IDA Pro >= 8.1
+# Configure IDA Pro >= 8.1 if TLS is NOT provided by the server
 export LUMINA_TLS=false
-export LUMINA_HOST="127.0.0.1"
-export LUMINA_PORT=1234
 ./ida64
 ```
 
@@ -165,19 +163,17 @@ bind_addr = "0.0.0.0:8080"
 
 ### Configuring IDA Pro
 
-#### IDA Pro >= 8.1
+You can simply configure the lumina server in the General → Lumina settings. You *do not* need this for the public dazhbog server.
+
+#### IDA Pro >= 8.1 if TLS is NOT enabled in the server
 
 ```bash
 # Linux
 export LUMINA_TLS=false
-export LUMINA_HOST="127.0.0.1"
-export LUMINA_PORT=1234
 ./ida64
 
 # Windows
 set LUMINA_TLS=false
-set LUMINA_HOST=127.0.0.1
-set LUMINA_PORT=1234
 ida64.exe
 ```
 
