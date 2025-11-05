@@ -9,9 +9,6 @@ pub struct Limits {
     pub push_timeout_ms: u64,
     pub max_active_conns: usize,
     // --- Per-frame hard caps ---
-    // Maximum wire payload sizes (big-endian length field from the wire), in bytes.
-    // For the new protocol, the length INCLUDES the 1-byte message type.
-    // For the legacy protocol, the length EXCLUDES the 1-byte message type.
     pub max_hello_frame_bytes: usize, // e.g., 4 MiB
     pub max_cmd_frame_bytes: usize,   // e.g., 16 MiB
     // --- Item-count & per-item caps (defend allocations before they happen) ---
@@ -52,6 +49,16 @@ pub struct Engine {
     pub compaction_check_ms: u64,
     pub use_mmap_reads: bool,
     pub deduplicate_on_startup: bool,
+
+    // ----------------- Disk index configuration (new) -----------------
+    /// Optional override directory for the disk index (defaults to data_dir/index).
+    pub index_dir: Option<String>,
+    /// Maximum entries to keep in the in-memory memtable before flushing to an SSTable.
+    pub index_memtable_max_entries: usize,
+    /// Target number of entries per SSTable block (fence pointer granularity).
+    pub index_block_entries: usize,
+    /// Trigger a full compaction when level-0 file count exceeds this threshold.
+    pub index_level0_compact_trigger: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -101,11 +108,16 @@ impl Default for Config {
                 data_dir: "data".into(),
                 segment_bytes: 1 << 30, // 1 GiB
                 shard_count: 64,
-                index_capacity: 1 << 30, // 1,073,741,824 slots (1 billion) - ~16GB RAM
+                index_capacity: 1 << 30, // legacy (unused by disk index)
                 sync_interval_ms: 200,
                 compaction_check_ms: 30000,
                 use_mmap_reads: false,
                 deduplicate_on_startup: false,
+                // Disk index defaults:
+                index_dir: None,
+                index_memtable_max_entries: 200_000,
+                index_block_entries: 128,
+                index_level0_compact_trigger: 8,
             },
             lumina: Lumina {
                 bind_addr: "0.0.0.0:20667".into(),
@@ -123,9 +135,6 @@ impl Config {
     pub fn load(path: &str) -> io::Result<Self> {
         let s = fs::read_to_string(path)?;
         // Minimal T0 "toml-like" parser to avoid deps.
-        // Format:
-        // group.key = value
-        // Strings must be in quotes, booleans true/false, ints decimal.
         let mut cfg = Self::default();
         for (lineno, line) in s.lines().enumerate() {
             let line = line.trim();
@@ -151,7 +160,6 @@ impl Config {
                     ("limits","pull_timeout_ms") => cfg.limits.pull_timeout_ms = parse!(u),
                     ("limits","push_timeout_ms") => cfg.limits.push_timeout_ms = parse!(u),
                     ("limits","max_active_conns") => cfg.limits.max_active_conns = parse!(usize_),
-                    // Additional limits:
                     ("limits","max_hello_frame_bytes") => cfg.limits.max_hello_frame_bytes = parse!(usize_),
                     ("limits","max_cmd_frame_bytes") => cfg.limits.max_cmd_frame_bytes = parse!(usize_),
                     ("limits","max_pull_items") => cfg.limits.max_pull_items = parse!(usize_),
@@ -175,6 +183,15 @@ impl Config {
                     ("engine","compaction_check_ms") => cfg.engine.compaction_check_ms = parse!(u),
                     ("engine","use_mmap_reads") => cfg.engine.use_mmap_reads = parse!(b),
                     ("engine","deduplicate_on_startup") => cfg.engine.deduplicate_on_startup = parse!(b),
+
+                    // ---------------- Disk index params (new parsers) ----------------
+                    ("engine","index_dir") => {
+                        let v = parse!(s);
+                        cfg.engine.index_dir = if v.is_empty() { None } else { Some(v) };
+                    },
+                    ("engine","index_memtable_max_entries") => cfg.engine.index_memtable_max_entries = parse!(usize_),
+                    ("engine","index_block_entries") => cfg.engine.index_block_entries = parse!(usize_),
+                    ("engine","index_level0_compact_trigger") => cfg.engine.index_level0_compact_trigger = parse!(usize_),
 
                     ("lumina","bind_addr") => cfg.lumina.bind_addr = parse!(s),
                     ("lumina","server_name") => cfg.lumina.server_name = parse!(s),

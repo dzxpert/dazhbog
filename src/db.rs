@@ -98,6 +98,10 @@ impl Database {
                     crate::metrics::METRICS.append_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Err(io::Error::new(io::ErrorKind::Other, "index full"));
                 }
+                Err(IndexError::Io(e)) => {
+                    crate::metrics::METRICS.append_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("index io error: {}", e)));
+                }
             }
         }
         Ok(status)

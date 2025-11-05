@@ -150,8 +150,6 @@ impl SegmentReader {
         // Backwards compatibility: if len_bytes doesn't match data_len, use actual data length
         // (Old data may have been written before strict invariant was enforced)
         let actual_len_bytes = if data_len != len_bytes as usize {
-            log::debug!("Record at offset {} has len_bytes={} but data_len={}, using actual data length", 
-                       "unknown", len_bytes, data_len);
             data_len as u32
         } else {
             len_bytes
