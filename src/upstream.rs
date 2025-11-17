@@ -63,14 +63,14 @@ impl UpstreamConn {
 fn parse_license_id(json_data: &[u8]) -> io::Result<[u8; 6]> {
     let json_str = std::str::from_utf8(json_data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("license not UTF-8: {}", e)))?;
-    
+
     // Find "id" field in licenses array (first occurrence after "licenses")
     if let Some(licenses_pos) = json_str.find(r#""licenses""#) {
         let search_from = &json_str[licenses_pos..];
         // Look for "id" field with optional whitespace: "id": "..."
         for line in search_from.lines() {
             if line.contains(r#""id""#) {
-                // Extract value after "id": 
+                // Extract value after "id":
                 if let Some(colon_pos) = line.find(':') {
                     let after_colon = &line[colon_pos+1..].trim_start();
                     if after_colon.starts_with('"') {
@@ -94,7 +94,7 @@ fn parse_license_id(json_data: &[u8]) -> io::Result<[u8; 6]> {
             }
         }
     }
-    
+
     Err(io::Error::new(io::ErrorKind::InvalidData, "could not find license ID in JSON"))
 }
 
@@ -108,13 +108,13 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
     } else {
         Vec::new()
     };
-    
+
     let lic_id = if !lic_bytes.is_empty() {
         parse_license_id(&lic_bytes)?
     } else {
         [0u8; 6]
     };
-    
+
     let payload = lumina::build_lumina_hello_payload(
         up.hello_protocol_version,
         &lic_bytes,
@@ -128,7 +128,7 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
     debug!("upstream: waiting for hello response");
     let (typ, pl) = conn.read(1 << 20).await?; // accept up to 1 MiB hello reply
     debug!("upstream: received hello response type=0x{:02x}, len={}", typ, pl.len());
-    
+
     // Check for failure response
     if typ == 0x0b {
         match lumina::decode_lumina_fail(&pl) {
@@ -146,7 +146,7 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
             }
         }
     }
-    
+
     // Expected success response is 0x31
     if typ != 0x31 {
         return Err(io::Error::new(
@@ -154,7 +154,7 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
             format!("upstream hello: unexpected response type 0x{:02x}", typ)
         ));
     }
-    
+
     Ok(())
 }
 
@@ -177,35 +177,35 @@ pub async fn fetch_from_upstreams(upstreams: &[crate::config::Upstream], keys: &
         return Ok(vec![None; keys.len()]);
     }
 
-    debug!("upstream: fetch_from_upstreams called for {} keys, trying {} servers in priority order", 
+    debug!("upstream: fetch_from_upstreams called for {} keys, trying {} servers in priority order",
            keys.len(), sorted_upstreams.len());
 
     // Track results for all keys
     let mut results: Vec<UpItem> = vec![None; keys.len()];
-    
+
     // Try each upstream server in priority order
     for (server_idx, up) in sorted_upstreams.iter().enumerate() {
         // Find which keys are still missing
         let mut missing_keys = Vec::new();
         let mut missing_positions = Vec::new();
-        
+
         for (i, item) in results.iter().enumerate() {
             if item.is_none() {
                 missing_keys.push(keys[i]);
                 missing_positions.push(i);
             }
         }
-        
+
         if missing_keys.is_empty() {
             debug!("upstream: all functions found after {} server(s)", server_idx);
             break;
         }
-        
-        debug!("upstream: querying server {} (priority={}, host={}:{}) for {} missing keys", 
+
+        debug!("upstream: querying server {} (priority={}, host={}:{}) for {} missing keys",
                server_idx, up.priority, up.host, up.port, missing_keys.len());
-        
+
         METRICS.upstream_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
+
         // Fetch from this upstream
         match fetch_from_single_upstream(up, &missing_keys).await {
             Ok(fetched) => {
@@ -227,7 +227,7 @@ pub async fn fetch_from_upstreams(upstreams: &[crate::config::Upstream], keys: &
             }
         }
     }
-    
+
     Ok(results)
 }
 
@@ -236,7 +236,7 @@ async fn fetch_from_single_upstream(up: &crate::config::Upstream, keys: &[u128])
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    
+
     let batch = up.batch_max.max(1);
     let mut results: Vec<UpItem> = vec![None; keys.len()];
 

@@ -102,7 +102,7 @@ fn print_help() {
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    
+
     // Check for help flag
     if let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {

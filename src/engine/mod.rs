@@ -31,13 +31,11 @@ impl EngineRuntime {
             dir.join("index")
         };
         std::fs::create_dir_all(&index_dir)?;
-        let idx_opts = crate::engine::index::IndexOptions {
-            memtable_max_entries: cfg.index_memtable_max_entries,
-            sst_block_entries: cfg.index_block_entries,
-            level0_compact_trigger: cfg.index_level0_compact_trigger,
-        };
+        // Sled-backed index; IndexOptions kept for API stability
+        let idx_opts = crate::engine::index::IndexOptions::sane();
         let index = Arc::new(ShardedIndex::open(&index_dir, idx_opts)?);
 
+        // Always rebuild index from segments if empty (or on first run).
         if index.entry_count() == 0 {
             segments.rebuild_index(&index)?;
         }

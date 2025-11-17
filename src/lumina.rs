@@ -94,11 +94,14 @@ fn pack_dd(v: u32) -> Vec<u8> {
     }
 }
 
+// NOTE: pack_dq must encode the low 32 bits first, then the high 32 bits,
+// matching how IDA expects dd(low) followed by dd(high). This fixes the
+// erroneous far-future timestamps reported by some clients.
 fn pack_dq(v: u64) -> Vec<u8> {
+    let low = (v & 0xFFFF_FFFF) as u32;
     let high = (v >> 32) as u32;
-    let low = (v & 0xFFFFFFFF) as u32;
-    let mut result = pack_dd(high);
-    result.extend_from_slice(&pack_dd(low));
+    let mut result = pack_dd(low);
+    result.extend_from_slice(&pack_dd(high));
     result
 }
 
@@ -301,11 +304,11 @@ pub fn parse_lumina_push_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
     let mut unk1 = Vec::with_capacity(cap_u64s);
 
     for i in 0..count_u64 {
-        let (high, c) = unpack_dd(&payload[offset..]);
+        let (low, c) = unpack_dd(&payload[offset..]);
         if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
-        let (low, c) = unpack_dd(&payload[offset..]);
+        let (high, c) = unpack_dd(&payload[offset..]);
         if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
@@ -604,8 +607,6 @@ mod tests {
         let statuses = vec![0u32];
         let mut buf = Vec::new();
         tokio_test::block_on(async {
-            let mut out = Vec::<u8>::new();
-            // use the builder functions directly (not sending over IO)
             let mut payload = BytesMut::new();
             payload.extend_from_slice(&super::pack_dd(funcs.len() as u32));
             for (pop, len, name, data) in &funcs {
@@ -618,7 +619,6 @@ mod tests {
             }
             buf = payload.to_vec();
         });
-        // Prepend the status count + status for decode
         let mut final_payload = Vec::new();
         final_payload.extend_from_slice(&pack_dd(statuses.len() as u32));
         for s in &statuses { final_payload.extend_from_slice(&pack_dd(*s)); }
@@ -630,5 +630,19 @@ mod tests {
         assert_eq!(ff[0].1, 4);
         assert_eq!(ff[0].2, "name");
         assert_eq!(ff[0].3, vec![1,2,3,4]);
+    }
+
+    #[test]
+    fn test_pack_dq_low_then_high() {
+        // Ensure pack_dq encodes low 32 then high 32 bits.
+        let v: u64 = 0x11223344_55667788;
+        let enc = pack_dq(v);
+        // First dd encodes low 32 (0x55667788) using variable form; start byte must reflect the dd encoding.
+        // Here we only test that decoding restores the original when read back in our hist writer.
+        // Decode back using the same dd decoder twice:
+        let (lo, c1) = super::unpack_dd(&enc[..]);
+        let (hi, _c2) = super::unpack_dd(&enc[c1..]);
+        assert_eq!(lo, 0x55667788);
+        assert_eq!(hi, 0x11223344);
     }
 }

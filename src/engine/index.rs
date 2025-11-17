@@ -1,74 +1,21 @@
-//! Disk-backed index: LSM-like (WAL + immutable SSTables + full compaction).
+//! Sled-backed index (u128 key → u64 address).
 //!
-//! Key → Addr mapping (u128 → u64). Crash safe via WAL; fast reads via
-//! in-memory memtable (BTreeMap) and per-SSTable fence-pointer index.
-//!
-//! Design notes
-//! ------------
-//! - WAL (append-only): records Upsert/Delete with CRC32C.
-//! - Memtable (BTreeMap): latest mutations while WAL grows.
-//! - Flush: when memtable exceeds threshold, it is flushed as a level-0
-//!   immutable SSTable (sorted, block-indexed). WAL is atomically rotated.
-//! - Reads: probe memtable first, then SSTables (newest → oldest), using
-//!   per-table fence pointers and block scans.
-//! - Compaction (full): when the number of L0 tables exceeds a threshold,
-//!   merge **all** SSTables into a single compacted SSTable. During merge
-//!   we keep only the newest version per key (ties broken by file sequence).
-//!
-//! No external dependencies; uses only std + our crc32c helper.
-//!
-//! Public API preserved where used by the codebase:
-//!   - `ShardedIndex::open(...)`
-//!   - `get`, `upsert`, `delete`
-//!   - `UpsertResult`, `IndexError`
-//!
-//! File layout
-//! -----------
-//! SSTable file (`sst.{seq}.ldb`)
-//!   [ blocks ... ]
-//!   [ index: u32 block_count
-//!           repeated block_count * ( first_key[16], offset:u64, length:u32 ) ]
-//!   [ trailer: index_offset:u64 ][ magic:u32 = 0x4C495A44 ('L','I','Z','D') ]
-//!
-//! Block:
-//!   [ u32 entry_count ]
-//!   repeated entry_count * ( key[16], tag:u8 (0=Del,1=Set), addr:u64 LE )
-//!   [ u32 crc32c of the block payload starting at entry_count ]
-//!
-//! WAL file (`wal.dat`)
-//!   repeated records:
-//!     [ u8 tag (0=Del,1=Set) ][ key[16] ][ addr:u64 LE ][ u32 crc32c(tag+key+addr) ]
-//!
-//! Safety & concurrency
-//! --------------------
-//! - `get`: RCU-like pattern; read memtable (RwLock), then snapshot SSTable
-//!   list (RwLock), scan readers newest→oldest.
-//! - `upsert`/`delete`: serialized by a lightweight `apply_lock` Mutex to keep
-//!   WAL append + memtable mutation atomic; readers remain lock-free.
-//! - Flush/compaction: done synchronously in the writer path when thresholds
-//!   trigger. SSTable list is swapped atomically under a write lock.
+//! This replaces the custom WAL/SSTable index with a robust embedded K/V store.
+//! API surface is kept stable where used by the rest of the codebase.
 
-use std::{
-    cmp::Ordering,
-    collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering as AtomOrdering},
-        Arc, Mutex, RwLock,
-    },
-};
+use std::{io, path::Path};
 
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt as _;
-
-use crate::engine::crc32c::crc32c;
-use crate::metrics::METRICS;
-
-// ============================= Public API types ==============================
+#[derive(Clone, Debug)]
+pub struct IndexOptions {
+    pub memtable_max_entries: usize,
+    pub sst_block_entries: usize,
+    pub level0_compact_trigger: usize,
+}
+impl IndexOptions {
+    pub fn sane() -> Self {
+        Self { memtable_max_entries: 0, sst_block_entries: 0, level0_compact_trigger: 0 }
+    }
+}
 
 pub enum UpsertResult {
     Inserted,
@@ -81,742 +28,111 @@ pub enum IndexError {
 }
 
 impl From<io::Error> for IndexError {
-    fn from(e: io::Error) -> Self {
-        IndexError::Io(e)
-    }
+    fn from(e: io::Error) -> Self { IndexError::Io(e) }
 }
 
-// ============================== Index Options ===============================
+fn k128(k: u128) -> [u8; 16] { k.to_le_bytes() }
 
-#[derive(Clone, Debug)]
-pub struct IndexOptions {
-    pub memtable_max_entries: usize,
-    pub sst_block_entries: usize,
-    pub level0_compact_trigger: usize,
-}
+fn v64(v: u64) -> [u8; 8] { v.to_le_bytes() }
 
-impl IndexOptions {
-    pub fn sane() -> Self {
-        Self {
-            memtable_max_entries: 200_000,
-            sst_block_entries: 128,
-            level0_compact_trigger: 8,
-        }
-    }
-}
-
-// =============================== Internals ==================================
-
-const SST_MAGIC_TRAILER: u32 = 0x4C495A44;
-const WAL_FILE_NAME: &str = "wal.dat";
-
-#[derive(Clone, Copy)]
-enum WalTag {
-    Delete = 0,
-    Set = 1,
-}
-
-#[inline]
-fn key_cmp(a: &u128, b: &u128) -> Ordering {
-    a.cmp(b)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Entry {
-    val: Option<u64>,
-}
-
-struct Wal {
-    path: PathBuf,
-    file: File,
-}
-
-impl Wal {
-    fn open(dir: &Path) -> io::Result<Self> {
-        let path = dir.join(WAL_FILE_NAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
-        Ok(Self { path, file })
-    }
-
-    fn append_set(&mut self, key: u128, addr: u64) -> io::Result<()> {
-        let mut buf = [0u8; 1 + 16 + 8 + 4];
-        buf[0] = WalTag::Set as u8;
-        buf[1..17].copy_from_slice(&key.to_le_bytes());
-        buf[17..25].copy_from_slice(&addr.to_le_bytes());
-        let c = crc32c(0, &buf[..1 + 16 + 8]);
-        buf[25..29].copy_from_slice(&c.to_le_bytes());
-        self.file.write_all(&buf)?;
-        Ok(())
-    }
-
-    fn append_del(&mut self, key: u128) -> io::Result<()> {
-        let mut buf = [0u8; 1 + 16 + 8 + 4];
-        buf[0] = WalTag::Delete as u8;
-        buf[1..17].copy_from_slice(&key.to_le_bytes());
-        buf[17..25].copy_from_slice(&0u64.to_le_bytes());
-        let c = crc32c(0, &buf[..1 + 16 + 8]);
-        buf[25..29].copy_from_slice(&c.to_le_bytes());
-        self.file.write_all(&buf)?;
-        Ok(())
-    }
-
-    fn replay(&mut self) -> io::Result<Vec<(WalTag, u128, Option<u64>)>> {
-        let mut out = Vec::new();
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut buf = [0u8; 1 + 16 + 8 + 4];
-        loop {
-            match self.file.read_exact(&mut buf) {
-                Ok(()) => {
-                    let tag = buf[0];
-                    let mut k_bytes = [0u8; 16];
-                    k_bytes.copy_from_slice(&buf[1..17]);
-                    let key = u128::from_le_bytes(k_bytes);
-                    let mut a_bytes = [0u8; 8];
-                    a_bytes.copy_from_slice(&buf[17..25]);
-                    let addr = u64::from_le_bytes(a_bytes);
-                    let mut c_bytes = [0u8; 4];
-                    c_bytes.copy_from_slice(&buf[25..29]);
-                    let crc = u32::from_le_bytes(c_bytes);
-                    let calc = crc32c(0, &buf[..1 + 16 + 8]);
-                    if calc != crc {
-                        break;
-                    }
-                    match tag {
-                        0 => out.push((WalTag::Delete, key, None)),
-                        1 => out.push((WalTag::Set, key, Some(addr))),
-                        _ => break,
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(out)
-    }
-
-    fn reset(&mut self) -> io::Result<()> {
-        let _ = &self.file;
-        let _ = fs::remove_file(&self.path);
-        self.file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-struct BlockMeta {
-    first_key: u128,
-    offset: u64,
-    length: u32,
-}
-
-struct SstReader {
-    path: PathBuf,
-    file: File,
-    blocks: Vec<BlockMeta>,
-    seq: u64,
-    entry_count: u64,
-}
-
-impl SstReader {
-    fn open(path: PathBuf, seq: u64) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).open(&path)?;
-        let len = file.metadata()?.len();
-        if len < 12 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "sst too small"));
-        }
-        let mut tail = [0u8; 12];
-        file.read_exact_at(&mut tail, len - 12)?;
-        let mut off_bytes = [0u8; 8];
-        off_bytes.copy_from_slice(&tail[0..8]);
-        let index_off = u64::from_le_bytes(off_bytes);
-        let mut magic_bytes = [0u8; 4];
-        magic_bytes.copy_from_slice(&tail[8..12]);
-        let magic = u32::from_le_bytes(magic_bytes);
-        if magic != SST_MAGIC_TRAILER {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad sst trailer"));
-        }
-        let mut idx_head = [0u8; 4 + 8];
-        file.read_exact_at(&mut idx_head, index_off)?;
-        let mut n_bytes = [0u8; 4];
-        n_bytes.copy_from_slice(&idx_head[0..4]);
-        let n = u32::from_le_bytes(n_bytes) as usize;
-        let mut total_entries_bytes = [0u8; 8];
-        total_entries_bytes.copy_from_slice(&idx_head[4..12]);
-        let total_entries = u64::from_le_bytes(total_entries_bytes);
-
-        let mut blocks = Vec::with_capacity(n);
-        let mut rec = [0u8; 16 + 8 + 4];
-        let mut p = index_off + 12;
-        for _ in 0..n {
-            file.read_exact_at(&mut rec, p)?;
-            let mut k = [0u8; 16];
-            k.copy_from_slice(&rec[0..16]);
-            let first_key = u128::from_le_bytes(k);
-            let mut offb = [0u8; 8];
-            offb.copy_from_slice(&rec[16..24]);
-            let offset = u64::from_le_bytes(offb);
-            let mut lb = [0u8; 4];
-            lb.copy_from_slice(&rec[24..28]);
-            let length = u32::from_le_bytes(lb);
-            blocks.push(BlockMeta { first_key, offset, length });
-            p += 28;
-        }
-        Ok(Self {
-            path,
-            file,
-            blocks,
-            seq,
-            entry_count: total_entries,
-        })
-    }
-
-    fn get(&self, key: u128) -> io::Result<Option<Option<u64>>> {
-        if self.blocks.is_empty() {
-            return Ok(None);
-        }
-        let mut lo = 0usize;
-        let mut hi = self.blocks.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if key_cmp(&self.blocks[mid].first_key, &key) == Ordering::Less
-                || self.blocks[mid].first_key == key
-            {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            return Ok(None);
-        }
-        let idx = lo - 1;
-        let bm = &self.blocks[idx];
-        let mut head = [0u8; 4];
-        self.file.read_exact_at(&mut head, bm.offset)?;
-        let mut n_bytes = [0u8; 4];
-        n_bytes.copy_from_slice(&head[0..4]);
-        let count = u32::from_le_bytes(n_bytes) as usize;
-        let payload_len = (16 + 1 + 8) * count;
-        let mut payload = vec![0u8; payload_len + 4];
-        self.file.read_exact_at(&mut payload, bm.offset + 4)?;
-        let (records, crc_bytes) = payload.split_at(payload_len);
-        let mut crc_arr = [0u8; 4];
-        crc_arr.copy_from_slice(crc_bytes);
-        let crc_on_disk = u32::from_le_bytes(crc_arr);
-        let calc = crc32c(0, records);
-        if calc != crc_on_disk {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "block crc mismatch"));
-        }
-        let mut p = 0usize;
-        for _ in 0..count {
-            let mut k = [0u8; 16];
-            k.copy_from_slice(&records[p..p + 16]);
-            let k128 = u128::from_le_bytes(k);
-            p += 16;
-            let tag = records[p];
-            p += 1;
-            let mut ab = [0u8; 8];
-            ab.copy_from_slice(&records[p..p + 8]);
-            let addr = u64::from_le_bytes(ab);
-            p += 8;
-            match key_cmp(&k128, &key) {
-                Ordering::Equal => {
-                    return Ok(Some(if tag == 0 { None } else { Some(addr) }));
-                }
-                Ordering::Greater => break,
-                Ordering::Less => continue,
-            }
-        }
-        Ok(None)
-    }
-
-    fn iter(&self) -> io::Result<SstIter<'_>> {
-        SstIter::new(self)
-    }
-}
-
-struct SstIter<'a> {
-    sst: &'a SstReader,
-    block_idx: usize,
-    block_count: usize,
-    block_buf: Vec<u8>,
-    cursor: usize,
-    entries_left_in_block: usize,
-}
-
-#[derive(Clone, Copy)]
-struct SstItem {
-    key: u128,
-    val: Option<u64>,
-}
-
-impl<'a> SstIter<'a> {
-    fn new(sst: &'a SstReader) -> io::Result<Self> {
-        Ok(Self {
-            sst,
-            block_idx: 0,
-            block_count: sst.blocks.len(),
-            block_buf: Vec::new(),
-            cursor: 0,
-            entries_left_in_block: 0,
-        })
-    }
-
-    fn load_block(&mut self) -> io::Result<bool> {
-        if self.block_idx >= self.block_count {
-            return Ok(false);
-        }
-        let bm = &self.sst.blocks[self.block_idx];
-        self.block_buf.clear();
-        self.block_buf.resize(bm.length as usize, 0);
-        self.sst
-            .file
-            .read_exact_at(&mut self.block_buf, bm.offset)?;
-        let count = u32::from_le_bytes(self.block_buf[0..4].try_into().unwrap()) as usize;
-        let payload = &self.block_buf[4..(4 + (16 + 1 + 8) * count)];
-        let crc_on_disk =
-            u32::from_le_bytes(self.block_buf[(4 + (16 + 1 + 8) * count)..][..4].try_into().unwrap());
-        let calc = crc32c(0, payload);
-        if calc != crc_on_disk {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "block crc mismatch (iter)",
-            ));
-        }
-        self.cursor = 4;
-        self.entries_left_in_block = count;
-        self.block_idx += 1;
-        Ok(true)
-    }
-}
-
-impl<'a> Iterator for SstIter<'a> {
-    type Item = io::Result<SstItem>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.entries_left_in_block > 0 {
-                let k = {
-                    let mut kb = [0u8; 16];
-                    kb.copy_from_slice(&self.block_buf[self.cursor..self.cursor + 16]);
-                    self.cursor += 16;
-                    u128::from_le_bytes(kb)
-                };
-                let tag = self.block_buf[self.cursor];
-                self.cursor += 1;
-                let addr = {
-                    let mut ab = [0u8; 8];
-                    ab.copy_from_slice(&self.block_buf[self.cursor..self.cursor + 8]);
-                    self.cursor += 8;
-                    u64::from_le_bytes(ab)
-                };
-                self.entries_left_in_block -= 1;
-                return Some(Ok(SstItem {
-                    key: k,
-                    val: if tag == 0 { None } else { Some(addr) },
-                }));
-            } else {
-                match self.load_block() {
-                    Ok(true) => continue,
-                    Ok(false) => return None,
-                    Err(e) => return Some(Err(e)),
-                }
-            }
-        }
-    }
-}
-
-struct SstWriter {
-    path: PathBuf,
-    file: File,
-    block_entries: usize,
-    cur_block: Vec<(u128, Entry)>,
-    index: Vec<BlockMeta>,
-    total_entries: u64,
-}
-
-impl SstWriter {
-    fn create(dir: &Path, seq: u64, block_entries: usize) -> io::Result<Self> {
-        let path = dir.join(format!("sst.{:016x}.ldb", seq));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        Ok(Self {
-            path,
-            file,
-            block_entries,
-            cur_block: Vec::with_capacity(block_entries),
-            index: Vec::new(),
-            total_entries: 0,
-        })
-    }
-
-    fn push(&mut self, key: u128, val: Entry) -> io::Result<()> {
-        if self.cur_block.is_empty() || self.cur_block.last().unwrap().0 <= key {
-            // ok
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SST push: keys not sorted",
-            ));
-        }
-        self.cur_block.push((key, val));
-        if self.cur_block.len() >= self.block_entries {
-            self.flush_block()?;
-        }
-        Ok(())
-    }
-
-    fn flush_block(&mut self) -> io::Result<()> {
-        if self.cur_block.is_empty() {
-            return Ok(());
-        }
-        let first_key = self.cur_block[0].0;
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        let count = self.cur_block.len();
-        let payload_len = (16 + 1 + 8) * count;
-        let mut buf = Vec::with_capacity(4 + payload_len + 4);
-        buf.extend_from_slice(&(count as u32).to_le_bytes());
-        for (k, e) in self.cur_block.iter() {
-            buf.extend_from_slice(&k.to_le_bytes());
-            buf.push(if e.val.is_some() { 1 } else { 0 });
-            buf.extend_from_slice(&e.val.unwrap_or(0).to_le_bytes());
-        }
-        let crc = crc32c(0, &buf[4..]);
-        buf.extend_from_slice(&crc.to_le_bytes());
-        self.file.write_all(&buf)?;
-        self.index.push(BlockMeta {
-            first_key,
-            offset,
-            length: buf.len() as u32,
-        });
-        self.total_entries += count as u64;
-        self.cur_block.clear();
-        Ok(())
-    }
-
-    fn finish(mut self) -> io::Result<SstReader> {
-        self.flush_block()?;
-        let idx_off = self.file.seek(SeekFrom::End(0))?;
-        self.file
-            .write_all(&(self.index.len() as u32).to_le_bytes())?;
-        self.file
-            .write_all(&self.total_entries.to_le_bytes())?;
-        for bm in &self.index {
-            self.file.write_all(&bm.first_key.to_le_bytes())?;
-            self.file.write_all(&bm.offset.to_le_bytes())?;
-            self.file.write_all(&bm.length.to_le_bytes())?;
-        }
-        self.file.write_all(&idx_off.to_le_bytes())?;
-        self.file
-            .write_all(&SST_MAGIC_TRAILER.to_le_bytes())?;
-        self.file.flush()?;
-        SstReader::open(self.path, 0)
-    }
-}
-
-pub struct ShardlessDiskIndex {
-    dir: PathBuf,
-    opts: IndexOptions,
-    apply_lock: Mutex<()>,
-    wal: Mutex<Wal>,
-    mem: RwLock<BTreeMap<u128, Entry>>,
-    ssts: RwLock<Vec<Arc<SstReader>>>,
-    seq: AtomicU64,
-}
-
-impl ShardlessDiskIndex {
-    fn index_dir(base: &Path) -> io::Result<PathBuf> {
-        fs::create_dir_all(base)?;
-        Ok(base.to_path_buf())
-    }
-
-    fn parse_seq_from_name(name: &str) -> Option<u64> {
-        if !name.starts_with("sst.") || !name.ends_with(".ldb") {
-            return None;
-        }
-        let hex = &name[4..(name.len() - 4)];
-        u64::from_str_radix(hex, 16).ok()
-    }
-
-    fn load_existing_ssts(dir: &Path) -> io::Result<(Vec<Arc<SstReader>>, u64)> {
-        let mut entries = Vec::new();
-        let mut max_seq = 0u64;
-        for ent in fs::read_dir(dir)? {
-            let ent = ent?;
-            let fname = ent.file_name();
-            let Some(fname_s) = fname.to_str() else { continue; };
-            if let Some(seq) = Self::parse_seq_from_name(fname_s) {
-                let path = dir.join(fname_s);
-                let rdr = Arc::new(SstReader::open(path, seq)?);
-                entries.push((seq, rdr));
-                if seq > max_seq {
-                    max_seq = seq;
-                }
-            }
-        }
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok((entries.into_iter().map(|(_, r)| r).collect(), max_seq))
-    }
-
-    fn open_internal(base: &Path, opts: IndexOptions) -> io::Result<Self> {
-        let dir = Self::index_dir(base)?;
-        let (ssts_vec, max_seq) = Self::load_existing_ssts(&dir)?;
-        let mut wal = Wal::open(&dir)?;
-        let mut mem = BTreeMap::<u128, Entry>::new();
-        for (tag, key, val) in wal.replay()? {
-            match tag {
-                WalTag::Set => mem.insert(key, Entry { val }),
-                WalTag::Delete => mem.insert(key, Entry { val: None }),
-            };
-        }
-        Ok(Self {
-            dir,
-            opts,
-            apply_lock: Mutex::new(()),
-            wal: Mutex::new(wal),
-            mem: RwLock::new(mem),
-            ssts: RwLock::new(ssts_vec),
-            seq: AtomicU64::new(max_seq.saturating_add(1)),
-        })
-    }
-
-    fn flush_memtable_locked(&self, mem_snapshot: BTreeMap<u128, Entry>) -> io::Result<()> {
-        if mem_snapshot.is_empty() {
-            self.wal.lock().unwrap().reset()?;
-            return Ok(());
-        }
-        let seq = self.seq.fetch_add(1, AtomOrdering::AcqRel);
-        let mut writer = SstWriter::create(&self.dir, seq, self.opts.sst_block_entries)?;
-        for (k, e) in mem_snapshot.iter() {
-            writer.push(*k, *e)?;
-        }
-        let reader = Arc::new(SstReader::open(writer.finish()?.path, seq)?);
-
-        {
-            let mut tables = self.ssts.write().unwrap();
-            let mut newv = Vec::with_capacity(tables.len() + 1);
-            newv.push(reader);
-            newv.extend_from_slice(&tables);
-            *tables = newv;
-        }
-
-        self.wal.lock().unwrap().reset()?;
-        Ok(())
-    }
-
-    fn maybe_flush_and_compact(&self) -> io::Result<()> {
-        let do_flush = {
-            let mem = self.mem.read().unwrap();
-            mem.len() >= self.opts.memtable_max_entries
-        };
-        if do_flush {
-            let snapshot = {
-                let mut mem = self.mem.write().unwrap();
-                std::mem::take(&mut *mem)
-            };
-            self.flush_memtable_locked(snapshot)?;
-        }
-
-        let do_compact = { self.ssts.read().unwrap().len() > self.opts.level0_compact_trigger };
-        if do_compact {
-            METRICS
-                .index_overflows
-                .fetch_add(1, AtomOrdering::Relaxed);
-            self.full_compaction()?;
-        }
-
-        Ok(())
-    }
-
-    fn full_compaction(&self) -> io::Result<()> {
-        let current = self.ssts.read().unwrap().clone();
-        if current.len() <= 1 {
-            return Ok(());
-        }
-
-        let seq = self.seq.fetch_add(1, AtomOrdering::AcqRel);
-        let mut writer = SstWriter::create(&self.dir, seq, self.opts.sst_block_entries)?;
-
-        let mut iters: Vec<_> = Vec::with_capacity(current.len());
-        for t in &current {
-            iters.push((t.seq, t.iter()?));
-        }
-
-        use std::collections::BinaryHeap;
-
-        #[derive(Eq)]
-        struct HeapElt {
-            key: u128,
-            seq: u64,
-            val: Option<u64>,
-            src: usize,
-        }
-        impl PartialEq for HeapElt {
-            fn eq(&self, other: &Self) -> bool {
-                self.key == other.key && self.seq == other.seq && self.src == other.src
-            }
-        }
-        impl PartialOrd for HeapElt {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for HeapElt {
-            fn cmp(&self, other: &Self) -> Ordering {
-                match self.key.cmp(&other.key) {
-                    Ordering::Less => Ordering::Greater,
-                    Ordering::Greater => Ordering::Less,
-                    Ordering::Equal => self.seq.cmp(&other.seq),
-                }
-            }
-        }
-
-        let mut heap: BinaryHeap<HeapElt> = BinaryHeap::new();
-
-        for (i, (seq_i, iter)) in iters.iter_mut().enumerate() {
-            if let Some(next) = iter.next() {
-                let it = next?;
-                heap.push(HeapElt {
-                    key: it.key,
-                    seq: *seq_i,
-                    val: it.val,
-                    src: i,
-                });
-            }
-        }
-
-        let mut last_written_key: Option<u128> = None;
-
-        while let Some(top) = heap.pop() {
-            if last_written_key == Some(top.key) {
-            } else {
-                writer.push(
-                    top.key,
-                    Entry {
-                        val: top.val,
-                    },
-                )?;
-                last_written_key = Some(top.key);
-            }
-            let src = top.src;
-            if let Some(next) = iters[src].1.next() {
-                let it = next?;
-                heap.push(HeapElt {
-                    key: it.key,
-                    seq: iters[src].0,
-                    val: it.val,
-                    src,
-                });
-            }
-        }
-
-        let new_reader = Arc::new(SstReader::open(writer.finish()?.path, seq)?);
-
-        {
-            let mut w = self.ssts.write().unwrap();
-            let old = std::mem::replace(&mut *w, vec![new_reader.clone()]);
-            drop(w);
-            for t in old {
-                let _ = fs::remove_file(&t.path);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn get(&self, key: u128) -> io::Result<u64> {
-        if let Some(e) = self.mem.read().unwrap().get(&key) {
-            return Ok(e.val.unwrap_or(0));
-        }
-        let ssts = self.ssts.read().unwrap().clone();
-        for t in &ssts {
-            if let Some(v) = t.get(key)? {
-                return Ok(v.unwrap_or(0));
-            }
-        }
-        Ok(0)
-    }
-
-    fn upsert(&self, key: u128, addr: u64) -> Result<UpsertResult, IndexError> {
-        let _g = self.apply_lock.lock().unwrap();
-        {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append_set(key, addr)?;
-        }
-        let prev = self
-            .mem
-            .write()
-            .unwrap()
-            .insert(key, Entry { val: Some(addr) });
-        self.maybe_flush_and_compact()?;
-        Ok(match prev {
-            None => UpsertResult::Inserted,
-            Some(e) => match e.val {
-                Some(v) if v != 0 => UpsertResult::Replaced(v),
-                _ => UpsertResult::Replaced(0),
-            },
-        })
-    }
-
-    fn delete(&self, key: u128) -> io::Result<Option<u64>> {
-        let _g = self.apply_lock.lock().unwrap();
-        {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append_del(key)?;
-        }
-        let prev = self.mem.write().unwrap().insert(key, Entry { val: None });
-        self.maybe_flush_and_compact()?;
-        Ok(prev.and_then(|e| e.val))
-    }
-
-    fn entry_count(&self) -> io::Result<u64> {
-        let mem_n = self.mem.read().unwrap().len() as u64;
-        let sst_n: u64 = self
-            .ssts
-            .read()
-            .unwrap()
-            .iter()
-            .map(|t| t.entry_count)
-            .sum();
-        Ok(mem_n + sst_n)
-    }
+fn dec64(b: &[u8]) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[0..8]);
+    u64::from_le_bytes(a)
 }
 
 pub struct ShardedIndex {
-    inner: ShardlessDiskIndex,
+    db: sled::Db,
+    tree: sled::Tree,
 }
 
 impl ShardedIndex {
-    pub fn open(dir: &Path, opts: IndexOptions) -> io::Result<Self> {
-        let inner = ShardlessDiskIndex::open_internal(dir, opts)?;
-        Ok(Self { inner })
+    pub fn open(dir: &Path, _opts: IndexOptions) -> io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        // Proactively move legacy files (wal.dat/sst.*) aside to avoid confusion.
+        migrate_legacy_index_files(dir)?;
+        let db = sled::Config::default()
+            .path(dir)
+            .cache_capacity(64 * 1024 * 1024)
+            .flush_every_ms(Some(500))
+            .open()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open: {e}")))?;
+        let tree = db.open_tree("latest").map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open_tree: {e}")))?;
+        Ok(Self { db, tree })
     }
 
     pub fn get(&self, key: u128) -> u64 {
-        self.inner.get(key).unwrap_or(0)
+        match self.tree.get(k128(key)) {
+            Ok(Some(v)) if v.len() >= 8 => dec64(&v),
+            _ => 0,
+        }
     }
 
     pub fn upsert(&self, key: u128, addr: u64) -> Result<UpsertResult, IndexError> {
-        self.inner.upsert(key, addr)
+        let res = self.tree.fetch_and_update(k128(key), |prev| {
+            match prev {
+                None => Some(v64(addr).to_vec()),
+                Some(_) => Some(v64(addr).to_vec()),
+            }
+        }).map_err(|e| IndexError::Io(io::Error::new(io::ErrorKind::Other, format!("sled upsert: {e}"))))?;
+        Ok(match res {
+            None => UpsertResult::Inserted,
+            Some(p) if p.len() >= 8 => UpsertResult::Replaced(dec64(&p)),
+            Some(_) => UpsertResult::Replaced(0),
+        })
     }
 
     pub fn delete(&self, key: u128) -> Option<u64> {
-        self.inner.delete(key).ok().flatten()
+        match self.tree.remove(k128(key)) {
+            Ok(Some(p)) if p.len() >= 8 => Some(dec64(&p)),
+            _ => None,
+        }
     }
 
     pub fn entry_count(&self) -> u64 {
-        self.inner.entry_count().unwrap_or(0)
+        self.tree.len() as u64
     }
+
+    /// Iterate over all keys in the index
+    pub fn iter_keys(&self) -> impl Iterator<Item = (u128, u64)> + '_ {
+        self.tree.iter().filter_map(|res| {
+            res.ok().and_then(|(k, v)| {
+                if k.len() >= 16 && v.len() >= 8 {
+                    let mut key_bytes = [0u8; 16];
+                    key_bytes.copy_from_slice(&k[0..16]);
+                    let key = u128::from_le_bytes(key_bytes);
+                    let addr = dec64(&v);
+                    Some((key, addr))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+}
+
+fn migrate_legacy_index_files(dir: &Path) -> io::Result<()> {
+    let mut found = false;
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue; };
+        if name == "wal.dat" || (name.starts_with("sst.") && name.ends_with(".ldb")) {
+            found = true;
+            break;
+        }
+    }
+    if !found { return Ok(()); }
+    let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let backup = dir.join(format!(".legacy_index_{}", stamp));
+    std::fs::create_dir_all(&backup)?;
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue; };
+        if name == "wal.dat" || (name.starts_with("sst.") && name.ends_with(".ldb")) {
+            std::fs::rename(ent.path(), backup.join(name))?;
+        }
+    }
+    Ok(())
 }

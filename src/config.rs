@@ -215,7 +215,7 @@ impl Config {
                         if parts.len() != 2 { return Err(format!("invalid upstream key format: {}", key)); }
                         let idx = parts[0].parse::<usize>().map_err(|e| e.to_string())?;
                         let field = parts[1];
-                        
+
                         // Ensure vector is large enough
                         while cfg.upstreams.len() <= idx {
                             cfg.upstreams.push(Upstream {
@@ -224,7 +224,7 @@ impl Config {
                                 timeout_ms: 8000, batch_max: 1024
                             });
                         }
-                        
+
                         match field {
                             "enabled" => cfg.upstreams[idx].enabled = parse!(b),
                             "priority" => cfg.upstreams[idx].priority = parse!(u32_),

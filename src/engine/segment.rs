@@ -1,7 +1,7 @@
 use std::{io, fs::{File, OpenOptions}, path::{Path, PathBuf}, os::unix::fs::FileExt};
 #[cfg(windows)] use std::os::windows::fs::FileExt as _;
 
-use crate::engine::crc32c::crc32c;
+use crate::engine::crc32c::{crc32c, crc32c_legacy};
 use crate::util::pack_addr;
 
 pub type Addr = u64;
@@ -44,7 +44,7 @@ pub struct OpenSegments {
 impl SegmentWriter {
     fn open(path: &Path, id: u16, cap: u64) -> io::Result<Self> {
         let p = path.join(format!("seg.{:05}.dat", id));
-        let file = OpenOptions::new().create(true).read(true).append(true).open(&p)?;
+        let file = OpenOptions::new().create(true).read(true).write(true).open(&p)?;
         let off = file.metadata()?.len();
         Ok(Self { file, id, cap, off })
     }
@@ -60,7 +60,7 @@ impl SegmentWriter {
         let name_len = rec.name.len() as u16;
         let data_len = rec.data.len() as u32;
 
-        let body_len: usize = 8+8+8+8+8+4+2+4+1+5 + (name_len as usize) + (data_len as usize);
+        let body_len: usize = 8+8+8+8+4+4+2+4+1+5 + (name_len as usize) + (data_len as usize);
         let total_len = 4 + 4 + 4 + body_len;
 
         if self.off + (total_len as u64) > self.cap {
@@ -87,7 +87,11 @@ impl SegmentWriter {
         buf.extend_from_slice(rec.name.as_bytes());
         buf.extend_from_slice(&rec.data);
 
+        // Canonical CRC-32C (Castagnoli, reflected)
         let crc = crc32c(0, &buf[12..]);
+        if self.off == 0 {
+            eprintln!("DEBUG: First write - CRC computed: 0x{:08x}, body_len: {}", crc, buf[12..].len());
+        }
         buf[8..12].copy_from_slice(&crc.to_le_bytes());
 
         let offset = self.off;
@@ -122,8 +126,21 @@ impl SegmentReader {
         let crc = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
         let mut body = vec![0u8; rec_len - 12];
         self.file.read_exact_at(&mut body, offset + 12)?;
-        let crc2 = crate::engine::crc32c::crc32c(0, &body);
-        if crc != crc2 { return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch")); }
+
+        // Verify with canonical CRC32C; if that fails, try legacy polynomial for
+        // backward compatibility with older corrupted-writer versions.
+        let crc2 = crc32c(0, &body);
+        if crc != crc2 {
+            let crc2_legacy = crc32c_legacy(0, &body);
+            if crc != crc2_legacy {
+                if offset < 500 {
+                    eprintln!("DEBUG READ: offset={}, stored_crc=0x{:08x}, computed_crc=0x{:08x}, legacy_crc=0x{:08x}, body_len={}",
+                              offset, crc, crc2, crc2_legacy, body.len());
+                }
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
+            }
+        }
+
         let p = &body[..];
         let lo = u64::from_le_bytes(p[0..8].try_into().unwrap());
         let hi = u64::from_le_bytes(p[8..16].try_into().unwrap());
@@ -227,15 +244,43 @@ impl OpenSegments {
                     continue;
                 }
 
-                let mut keybuf = [0u8; 16];
-                r.file.read_exact_at(&mut keybuf, off + 12)?;
+                // Read body first
+                let stored_crc = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+                let body_len = (rec_len - 12) as usize;
+                let mut body = vec![0u8; body_len];
+                if r.file.read_exact_at(&mut body, off + 12).is_err() {
+                    log::warn!("Skipping record at offset {}: failed to read body", off);
+                    off += rec_len;
+                    total_processed += rec_len;
+                    continue;
+                }
+
+                // Extract key and flags BEFORE CRC validation so we can delete corrupt entries from index
+                let keybuf = &body[0..16];
                 let lo = u64::from_le_bytes(keybuf[0..8].try_into().unwrap());
                 let hi = u64::from_le_bytes(keybuf[8..16].try_into().unwrap());
                 let key = ((hi as u128) << 64) | (lo as u128);
+                let flags = body[8 + 8 + 8 + 8 + 4 + 4 + 2 + 4];
 
-                let mut fb = [0u8; 1];
-                r.file.read_exact_at(&mut fb, off + 12 + 8 + 8 + 8 + 8 + 4 + 4 + 2 + 4)?;
-                let flags = fb[0];
+                // Verify with canonical CRC32C; if that fails, try legacy polynomial
+                let computed_crc = crc32c(0, &body);
+                let crc_valid = if computed_crc == stored_crc {
+                    true
+                } else {
+                    let computed_crc_legacy = crc32c_legacy(0, &body);
+                    if computed_crc_legacy == stored_crc {
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if !crc_valid {
+                    log::warn!("Skipping corrupt record at seg={}, offset={}, key={:032x}: CRC mismatch (stored={:#x}, computed={:#x})", r.id, off, key, stored_crc, computed_crc);
+                    off += rec_len;
+                    total_processed += rec_len;
+                    continue;
+                }
 
                 match callback(r, off, rec_len, key, flags)? {
                     ScanAction::Continue => {},
@@ -319,15 +364,21 @@ impl OpenSegments {
         }
 
         let mut progress = ProgressReporter::new(total_size);
+        let mut corrupt_count = 0u64;
 
-        self.scan_records(&rs, |r, off, rec_len, key, flags| {
-            let addr = crate::util::pack_addr(r.id, off, flags);
-
-            if flags & 0x01 == 0x01 {
+        self.scan_records_with_corruption(&rs, |r, off, rec_len, key, flags, is_corrupt| {
+            if is_corrupt {
+                // Delete corrupt entries from index
                 index.delete(key);
+                corrupt_count += 1;
             } else {
-                if let Err(_) = index.upsert(key, addr) {
-                    log::warn!("Index full during rebuild for key {:032x}", key);
+                let addr = crate::util::pack_addr(r.id, off, flags);
+                if flags & 0x01 == 0x01 {
+                    index.delete(key);
+                } else {
+                    if let Err(_) = index.upsert(key, addr) {
+                        log::warn!("Index full during rebuild for key {:032x}", key);
+                    }
                 }
             }
 
@@ -336,10 +387,97 @@ impl OpenSegments {
         })?;
 
         if total_size > 0 {
-            log::info!("Segments loaded successfully");
+            if corrupt_count > 0 {
+                log::info!("Segments loaded successfully ({} corrupt entries skipped)", corrupt_count);
+            } else {
+                log::info!("Segments loaded successfully");
+            }
         }
 
         Ok(())
+    }
+
+    fn scan_records_with_corruption<F>(&self, readers: &[SegmentReader], mut callback: F) -> io::Result<u64>
+    where
+        F: FnMut(&SegmentReader, u64, u64, u128, u8, bool) -> io::Result<ScanAction>,
+    {
+        const MIN_STRUCTURED_SIZE: u64 = 12 + 16 + 8 + 8 + 4 + 4 + 2 + 4 + 1;
+        let mut total_processed = 0u64;
+
+        for r in readers.iter() {
+            let len = r.file.metadata()?.len();
+            let mut off = 0u64;
+
+            while off + 12 < len {
+                let mut hdr = [0u8; 12];
+                if r.file.read_exact_at(&mut hdr, off).is_err() {
+                    break;
+                }
+
+                let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+                if magic != MAGIC {
+                    break;
+                }
+
+                let rec_len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as u64;
+                if rec_len == 0 || off + rec_len > len {
+                    break;
+                }
+
+                if rec_len < MIN_STRUCTURED_SIZE {
+                    log::warn!("Skipping malformed record at offset {}: rec_len {} < minimum {}", off, rec_len, MIN_STRUCTURED_SIZE);
+                    off += rec_len;
+                    total_processed += rec_len;
+                    continue;
+                }
+
+                // Read body
+                let stored_crc = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+                let body_len = (rec_len - 12) as usize;
+                let mut body = vec![0u8; body_len];
+                if r.file.read_exact_at(&mut body, off + 12).is_err() {
+                    log::warn!("Skipping record at offset {}: failed to read body", off);
+                    off += rec_len;
+                    total_processed += rec_len;
+                    continue;
+                }
+
+                // Extract key and flags
+                let keybuf = &body[0..16];
+                let lo = u64::from_le_bytes(keybuf[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(keybuf[8..16].try_into().unwrap());
+                let key = ((hi as u128) << 64) | (lo as u128);
+                let flags = body[8 + 8 + 8 + 8 + 4 + 4 + 2 + 4];
+
+                // Verify CRC
+                let computed_crc = crc32c(0, &body);
+                let crc_valid = if computed_crc == stored_crc {
+                    true
+                } else {
+                    let computed_crc_legacy = crc32c_legacy(0, &body);
+                    if computed_crc_legacy == stored_crc {
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                let is_corrupt = !crc_valid;
+                if is_corrupt {
+                    log::warn!("Corrupt record at seg={}, offset={}, key={:032x}: CRC mismatch (stored={:#x}, computed={:#x})", r.id, off, key, stored_crc, computed_crc);
+                }
+
+                match callback(r, off, rec_len, key, flags, is_corrupt)? {
+                    ScanAction::Continue => {},
+                    ScanAction::Break => return Ok(total_processed),
+                }
+
+                off += rec_len;
+                total_processed += rec_len;
+            }
+        }
+
+        Ok(total_processed)
     }
 
     pub fn deduplicate(&self) -> io::Result<(u64, u64, u64)> {
