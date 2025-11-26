@@ -52,6 +52,12 @@ pub struct Engine {
 }
 
 #[derive(Clone, Debug)]
+pub struct Debug {
+    pub dump_hello: bool,
+    pub dump_hello_dir: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct Lumina {
     pub bind_addr: String,
     pub server_name: String,
@@ -118,6 +124,7 @@ pub struct Config {
     pub lumina: Lumina,
     pub upstreams: Vec<Upstream>,
     pub scoring: Scoring,
+    pub debug: Debug,
 }
 
 impl Default for Config {
@@ -170,6 +177,10 @@ impl Default for Config {
             },
             upstreams: Vec::new(),
             scoring: Scoring::default(),
+            debug: Debug {
+                dump_hello: false,
+                dump_hello_dir: "debug_dumps".into(),
+            },
         }
     }
 }
@@ -369,6 +380,10 @@ impl Config {
                             _ => return Err(format!("unknown upstream field: {}", field)),
                         }
                     }
+
+                    // ---------------- Debug (optional) ----------------
+                    ("debug", "dump_hello") => cfg.debug.dump_hello = parse!(b),
+                    ("debug", "dump_hello_dir") => cfg.debug.dump_hello_dir = parse!(s),
 
                     // ---------------- Scoring (optional) ----------------
                     ("scoring", "w_md5") => cfg.scoring.w_md5 = parse!(f64_),

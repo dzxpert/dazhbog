@@ -138,21 +138,32 @@ pub fn pack_var_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn parse_lumina_hello(payload: &[u8]) -> Result<LuminaHello, LuminaError> {
+/// Raw hello data for debug dumps
+pub struct LuminaHelloRaw {
+    pub protocol_version: u32,
+    pub license_data: Vec<u8>,
+    pub id_bytes: [u8; 6],
+    pub username: String,
+    pub password: String,
+}
+
+pub fn parse_lumina_hello_raw(payload: &[u8]) -> Result<LuminaHelloRaw, LuminaError> {
     let mut offset = 0;
     let (protocol_version, consumed) = unpack_dd(&payload[offset..]);
     if consumed == 0 {
         return Err(LuminaError::UnexpectedEof);
     }
     offset += consumed;
-    debug!("Lumina Hello: protocol_version={}", protocol_version);
 
-    let (_license_data, consumed) = unpack_var_bytes_capped(&payload[offset..], 16384)?;
+    let (license_data, consumed) = unpack_var_bytes_capped(&payload[offset..], 16384)?;
+    let license_data = license_data.to_vec();
     offset += consumed;
 
     if payload.len() < offset + 6 {
         return Err(LuminaError::UnexpectedEof);
     }
+    let mut id_bytes = [0u8; 6];
+    id_bytes.copy_from_slice(&payload[offset..offset + 6]);
     offset += 6;
 
     let (_unk2, consumed) = unpack_dd(&payload[offset..]);
@@ -176,10 +187,22 @@ pub fn parse_lumina_hello(payload: &[u8]) -> Result<LuminaHello, LuminaError> {
         ("guest".to_string(), String::new())
     };
 
-    Ok(LuminaHello {
+    Ok(LuminaHelloRaw {
         protocol_version,
+        license_data,
+        id_bytes,
         username,
         password,
+    })
+}
+
+pub fn parse_lumina_hello(payload: &[u8]) -> Result<LuminaHello, LuminaError> {
+    let raw = parse_lumina_hello_raw(payload)?;
+    debug!("Lumina Hello: protocol_version={}", raw.protocol_version);
+    Ok(LuminaHello {
+        protocol_version: raw.protocol_version,
+        username: raw.username,
+        password: raw.password,
     })
 }
 

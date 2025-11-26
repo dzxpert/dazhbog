@@ -184,6 +184,42 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     const LUMINA_MSG_HELLO: u8 = 0x0d;
     let is_lumina = msg_type == LUMINA_MSG_HELLO;
 
+    // Debug: dump hello message to file if enabled (only for Lumina protocol)
+    if cfg.debug.dump_hello && is_lumina {
+        if let Ok(raw) = lumina::parse_lumina_hello_raw(payload) {
+            // Only dump if license is at least 128 bytes
+            if raw.license_data.len() >= 128 {
+                use std::io::Write;
+                let hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    raw.license_data.hash(&mut hasher);
+                    hasher.finish()
+                };
+                let filename = format!("{:016x}.txt", hash);
+                let path = std::path::Path::new(&cfg.debug.dump_hello_dir).join(&filename);
+                if let Err(e) = std::fs::create_dir_all(&cfg.debug.dump_hello_dir) {
+                    warn!("Failed to create dump directory: {}", e);
+                } else if let Ok(mut f) = std::fs::File::create(&path) {
+                    let id_hex = raw.id_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                    let content = format!(
+                        "ID: {}\n\nLicense:\n\n{}\n\nCredentials: {} / {}\n",
+                        id_hex,
+                        String::from_utf8_lossy(&raw.license_data),
+                        raw.username,
+                        raw.password
+                    );
+                    if let Err(e) = f.write_all(content.as_bytes()) {
+                        warn!("Failed to write hello dump: {}", e);
+                    } else {
+                        debug!("Dumped hello message to {:?}", path);
+                    }
+                }
+            }
+        }
+    }
+
     let hello = if is_lumina {
         debug!("Detected Lumina Hello message (0x0d)");
         match lumina::parse_lumina_hello(payload) {
