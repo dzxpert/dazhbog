@@ -157,9 +157,19 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
         up.hello_protocol_version,
         lic_bytes.len()
     );
-    conn.write(0x0d, &payload).await?;
+    tokio::time::timeout(
+        std::time::Duration::from_millis(up.timeout_ms),
+        conn.write(0x0d, &payload),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hello write timeout"))??;
     debug!("upstream: waiting for hello response");
-    let (typ, pl) = conn.read(1 << 20).await?; // accept up to 1 MiB hello reply
+    let (typ, pl) = tokio::time::timeout(
+        std::time::Duration::from_millis(up.timeout_ms),
+        conn.read(1 << 20),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hello read timeout"))??; // accept up to 1 MiB hello reply
     debug!(
         "upstream: received hello response type=0x{:02x}, len={}",
         typ,
@@ -345,7 +355,20 @@ async fn fetch_from_single_upstream(
             slice.len(),
             pull_payload.len()
         );
-        if let Err(e) = conn.write(0x0e, &pull_payload).await {
+        let write_result = tokio::time::timeout(
+            std::time::Duration::from_millis(up.timeout_ms),
+            conn.write(0x0e, &pull_payload),
+        )
+        .await;
+        if let Err(e) = write_result {
+            METRICS
+                .upstream_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("upstream write pull timeout: {}", e);
+            start = end;
+            continue;
+        }
+        if let Err(e) = write_result.unwrap() {
             METRICS
                 .upstream_errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -356,8 +379,13 @@ async fn fetch_from_single_upstream(
 
         // Read PullResult (0x0f)
         debug!("upstream: waiting for PullResult response");
-        let (typ, payload) = match conn.read(64 * 1024 * 1024).await {
-            Ok(v) => {
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_millis(up.timeout_ms),
+            conn.read(64 * 1024 * 1024),
+        )
+        .await;
+        let (typ, payload) = match read_result {
+            Ok(Ok(v)) => {
                 debug!(
                     "upstream: received response type=0x{:02x}, payload {} bytes",
                     v.0,
@@ -365,11 +393,19 @@ async fn fetch_from_single_upstream(
                 );
                 v
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 METRICS
                     .upstream_errors
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!("upstream read pull failed: {} (io kind: {:?})", e, e.kind());
+                start = end;
+                continue;
+            }
+            Err(_) => {
+                METRICS
+                    .upstream_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("upstream read pull timeout");
                 start = end;
                 continue;
             }
