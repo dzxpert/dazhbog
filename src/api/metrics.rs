@@ -1,5 +1,8 @@
+//! Global metrics collection using atomic counters.
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Global metrics structure.
 #[derive(Default)]
 pub struct Metrics {
     pub pulls: AtomicU64,
@@ -26,10 +29,12 @@ pub struct Metrics {
     pub scoring_time_ns: AtomicU64,
 }
 
+/// Global metrics singleton.
 pub static METRICS: once_cell::sync::Lazy<&'static Metrics> =
     once_cell::sync::Lazy::new(|| Box::leak(Box::new(Metrics::default())));
 
 impl Metrics {
+    /// Render metrics in Prometheus exposition format.
     pub fn render_prometheus(&self) -> String {
         let g = |name: &str, help: &str, val: u64| -> String {
             format!(

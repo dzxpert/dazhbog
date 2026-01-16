@@ -7,8 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::common::addr::pack_addr;
 use crate::engine::crc32c::{crc32c, crc32c_legacy};
-use crate::util::pack_addr;
 
 pub type Addr = u64;
 
@@ -550,7 +550,7 @@ impl OpenSegments {
                 index.delete(key);
                 corrupt_count += 1;
             } else {
-                let addr = crate::util::pack_addr(r.id, off, flags);
+                let addr = pack_addr(r.id, off, flags);
                 if flags & 0x01 == 0x01 {
                     index.delete(key);
                 } else {
@@ -575,6 +575,31 @@ impl OpenSegments {
             }
         }
 
+        Ok(())
+    }
+
+    /// Iterate over all records in all segment trees, invoking the callback for each decoded record.
+    /// Corrupt or unreadable records are skipped.
+    pub fn for_each_record<F>(&self, mut callback: F) -> io::Result<()>
+    where
+        F: FnMut(u16, u64, &Record) -> io::Result<()>,
+    {
+        let rs = self.readers.lock();
+        for r in rs.iter() {
+            for item in r.tree.iter() {
+                let (key_bytes, _data) = match item {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let offset = u64::from_be_bytes(key_bytes.as_ref().try_into().unwrap());
+                match r.read_at(offset) {
+                    Ok(rec) => {
+                        callback(r.id, offset, &rec)?;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
         Ok(())
     }
 
@@ -691,7 +716,7 @@ impl OpenSegments {
         self.scan_records(&rs, |r, off, rec_len, _key, flags| {
             if flags & 0x01 == 0 {
                 if let Ok(rec) = r.read_at(off) {
-                    let addr = crate::util::pack_addr(r.id, off, rec.flags);
+                    let addr = pack_addr(r.id, off, rec.flags);
                     key_records
                         .entry(rec.key)
                         .or_insert_with(Vec::new)
@@ -770,7 +795,7 @@ impl OpenSegments {
 
         let rs = self.readers.lock();
         self.scan_records(&rs, |r, off, rec_len, _key, _flags| {
-            let addr = crate::util::pack_addr(r.id, off, 0);
+            let addr = pack_addr(r.id, off, 0);
 
             if keep_addrs.contains(&addr) {
                 if let Ok(rec) = r.read_at(off) {

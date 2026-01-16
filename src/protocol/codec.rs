@@ -1,16 +1,19 @@
+//! Low-level binary serialization primitives.
+//!
+//! Wire protocol uses big-endian (network byte order) for length prefix,
+//! and little-endian for internal data fields.
+
+use crate::common::error::CodecError;
 use bytes::{BufMut, BytesMut};
 
-#[derive(Debug)]
-pub enum CodecError {
-    Short,
-    Malformed(#[allow(dead_code)] &'static str),
-}
-
+/// Write a u128 in little-endian format.
 #[allow(dead_code)]
 pub fn put_u128_le(dst: &mut BytesMut, v: u128) {
     dst.put_u64_le(v as u64);
     dst.put_u64_le((v >> 64) as u64);
 }
+
+/// Read a u128 in little-endian format.
 pub fn get_u128_le(src: &mut &[u8]) -> Result<u128, CodecError> {
     if src.len() < 16 {
         return Err(CodecError::Short);
@@ -24,11 +27,13 @@ pub fn get_u128_le(src: &mut &[u8]) -> Result<u128, CodecError> {
     Ok((hi as u128) << 64 | (lo as u128))
 }
 
+/// Write a length-prefixed string (4-byte LE length + bytes).
 pub fn put_str(dst: &mut BytesMut, s: &str) {
     dst.put_u32_le(s.len() as u32);
     dst.extend_from_slice(s.as_bytes());
 }
 
+/// Read a length-prefixed string.
 pub fn get_str(src: &mut &[u8]) -> Result<String, CodecError> {
     if src.len() < 4 {
         return Err(CodecError::Short);
@@ -49,8 +54,7 @@ pub fn get_str(src: &mut &[u8]) -> Result<String, CodecError> {
     Ok(s.to_string())
 }
 
-// --- Capped versions to enforce per-item maxima and fail early ---
-
+/// Read a length-prefixed string with maximum length enforcement.
 pub fn get_str_max(src: &mut &[u8], max_len: usize) -> Result<String, CodecError> {
     if src.len() < 4 {
         return Err(CodecError::Short);
@@ -75,13 +79,13 @@ pub fn get_str_max(src: &mut &[u8], max_len: usize) -> Result<String, CodecError
     Ok(s.to_string())
 }
 
+/// Write a length-prefixed byte array (4-byte LE length + bytes).
 pub fn put_bytes(dst: &mut BytesMut, b: &[u8]) {
     dst.put_u32_le(b.len() as u32);
     dst.extend_from_slice(b);
 }
 
-// --- Capped version ---
-
+/// Read a length-prefixed byte array with maximum length enforcement.
 pub fn get_bytes_max(src: &mut &[u8], max_len: usize) -> Result<Vec<u8>, CodecError> {
     if src.len() < 4 {
         return Err(CodecError::Short);
@@ -106,6 +110,7 @@ pub fn get_bytes_max(src: &mut &[u8], max_len: usize) -> Result<Vec<u8>, CodecEr
     Ok(v)
 }
 
+/// Create a wire-format frame with message type and payload.
 pub fn frame(msg_type: u8, payload: &[u8]) -> BytesMut {
     let mut buf = BytesMut::with_capacity(4 + 1 + payload.len());
 

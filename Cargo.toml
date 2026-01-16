@@ -35,6 +35,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sled = "0.34"
 tokio-test = "0.4.4"
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = { version = "0.21", default-features = false, features = ["mmap", "lz4-compression"] }
+percent-encoding = "2"
+
+[patch.crates-io]
+zstd-safe = { path = "vendor/zstd-safe" }
 
 [profile.release]
 lto = "fat"

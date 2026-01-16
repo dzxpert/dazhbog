@@ -53,14 +53,14 @@ async fn test_protocol_v3_handshake() {
     // Read response
     let response = read_frame(&mut stream).await.unwrap();
     assert!(!response.is_empty(), "Empty response");
-    
+
     let msg_type = response[0];
     let payload = &response[1..];
-    
+
     // For protocol v3, expect MSG_OK (0x04) with empty payload
     assert_eq!(msg_type, 0x04, "Expected MSG_OK (0x04) for protocol v3");
     assert_eq!(payload.len(), 0, "Expected empty payload for protocol v3");
-    
+
     println!("✓ Protocol v3 handshake successful");
 }
 
@@ -82,16 +82,26 @@ async fn test_protocol_v6_handshake() {
     // Read response
     let response = read_frame(&mut stream).await.unwrap();
     assert!(!response.is_empty(), "Empty response");
-    
+
     let msg_type = response[0];
     let payload = &response[1..];
-    
+
     // For protocol v6, expect MSG_HELLO_OK (0x02) with u32 features
-    assert_eq!(msg_type, 0x02, "Expected MSG_HELLO_OK (0x02) for protocol v6");
-    assert_eq!(payload.len(), 4, "Expected 4-byte features payload for protocol v6");
-    
+    assert_eq!(
+        msg_type, 0x02,
+        "Expected MSG_HELLO_OK (0x02) for protocol v6"
+    );
+    assert_eq!(
+        payload.len(),
+        4,
+        "Expected 4-byte features payload for protocol v6"
+    );
+
     let features = u32::from_le_bytes(payload.try_into().unwrap());
-    println!("✓ Protocol v6 handshake successful, features: 0x{:08x}", features);
+    println!(
+        "✓ Protocol v6 handshake successful, features: 0x{:08x}",
+        features
+    );
 }
 
 #[tokio::test]
@@ -114,7 +124,7 @@ async fn test_pull_nonexistent_key() {
     pull_payload.put_u32_le(1); // 1 key
     pull_payload.put_u64_le(0xDEADBEEF); // key low
     pull_payload.put_u64_le(0xCAFEBABE); // key high
-    
+
     let pull_frame = frame(0x10, &pull_payload);
     stream.write_all(&pull_frame).await.unwrap();
     stream.flush().await.unwrap();
@@ -122,18 +132,18 @@ async fn test_pull_nonexistent_key() {
     // Read PULL_OK response
     let response = read_frame(&mut stream).await.unwrap();
     assert!(!response.is_empty(), "Empty response");
-    
+
     let msg_type = response[0];
     assert_eq!(msg_type, 0x11, "Expected MSG_PULL_OK (0x11)");
-    
+
     let payload = &response[1..];
     assert!(payload.len() >= 8, "Payload too short");
-    
+
     let n_status = u32::from_le_bytes(payload[0..4].try_into().unwrap());
     assert_eq!(n_status, 1, "Expected 1 status entry");
-    
+
     let status = u32::from_le_bytes(payload[4..8].try_into().unwrap());
     assert_eq!(status, 1, "Expected status=1 (not found)");
-    
+
     println!("✓ PULL for non-existent key correctly returned status=1");
 }

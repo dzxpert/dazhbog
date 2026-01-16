@@ -3,16 +3,21 @@
 //! This module tests the server's performance under various stress conditions,
 //! including high load, memory pressure, and concurrent operations.
 
-use std::time::{Duration, Instant};
-use tokio::time::{timeout, sleep};
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
-use std::sync::Arc;
 use rand::{Rng, RngCore};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
+use tokio::time::{sleep, timeout};
 
 async fn connect_to_server() -> Option<TcpStream> {
-    match timeout(Duration::from_secs(1), TcpStream::connect("127.0.0.1:20667")).await {
+    match timeout(
+        Duration::from_secs(1),
+        TcpStream::connect("127.0.0.1:20667"),
+    )
+    .await
+    {
         Ok(Ok(stream)) => Some(stream),
         _ => {
             eprintln!("Server not running on 127.0.0.1:20667, skipping performance tests");
@@ -45,7 +50,10 @@ async fn read_with_timeout<R: AsyncReadExt + Unpin>(
 ) -> std::io::Result<usize> {
     match timeout(Duration::from_millis(timeout_ms), reader.read(buf)).await {
         Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout")),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "read timeout",
+        )),
     }
 }
 
@@ -122,11 +130,20 @@ async fn test_sustained_high_load() {
     println!("Sustained load test completed:");
     println!("  Duration: {:?}", test_duration);
     println!("  Total requests: {}", total_requests);
-    println!("  Successful: {} ({:.1}%)", successful_requests,
-             (successful_requests as f64 / total_requests as f64) * 100.0);
-    println!("  Failed: {} ({:.1}%)", failed_requests,
-             (failed_requests as f64 / total_requests as f64) * 100.0);
-    println!("  Requests/second: {:.1}", total_requests as f64 / test_duration.as_secs_f64());
+    println!(
+        "  Successful: {} ({:.1}%)",
+        successful_requests,
+        (successful_requests as f64 / total_requests as f64) * 100.0
+    );
+    println!(
+        "  Failed: {} ({:.1}%)",
+        failed_requests,
+        (failed_requests as f64 / total_requests as f64) * 100.0
+    );
+    println!(
+        "  Requests/second: {:.1}",
+        total_requests as f64 / test_duration.as_secs_f64()
+    );
 }
 
 #[tokio::test]
@@ -143,8 +160,9 @@ async fn test_memory_pressure_simulation() {
             for request_id in 0..10 {
                 let stream_result = timeout(
                     Duration::from_millis(1000),
-                    TcpStream::connect("127.0.0.1:20667")
-                ).await;
+                    TcpStream::connect("127.0.0.1:20667"),
+                )
+                .await;
 
                 match stream_result {
                     Ok(Ok(mut stream)) => {
@@ -159,32 +177,47 @@ async fn test_memory_pressure_simulation() {
                         message.extend_from_slice(&large_data);
 
                         let start_time = Instant::now();
-                        let write_result = timeout(
-                            Duration::from_millis(2000),
-                            stream.write_all(&message)
-                        ).await;
+                        let write_result =
+                            timeout(Duration::from_millis(2000), stream.write_all(&message)).await;
 
                         let response_time = start_time.elapsed();
 
                         match write_result {
                             Ok(Ok(_)) => {
                                 let mut buf = vec![0u8; 1024];
-                                let read_result = read_with_timeout(&mut stream, &mut buf, 2000).await;
+                                let read_result =
+                                    read_with_timeout(&mut stream, &mut buf, 2000).await;
                                 if read_result.is_ok() {
-                                    results.push(format!("req_{}_{}: success_{}ms",
-                                                       client_id, request_id, response_time.as_millis()));
+                                    results.push(format!(
+                                        "req_{}_{}: success_{}ms",
+                                        client_id,
+                                        request_id,
+                                        response_time.as_millis()
+                                    ));
                                 } else {
-                                    results.push(format!("req_{}_{}: read_fail_{}ms",
-                                                       client_id, request_id, response_time.as_millis()));
+                                    results.push(format!(
+                                        "req_{}_{}: read_fail_{}ms",
+                                        client_id,
+                                        request_id,
+                                        response_time.as_millis()
+                                    ));
                                 }
                             }
                             Ok(Err(_)) => {
-                                results.push(format!("req_{}_{}: write_fail_{}ms",
-                                                   client_id, request_id, response_time.as_millis()));
+                                results.push(format!(
+                                    "req_{}_{}: write_fail_{}ms",
+                                    client_id,
+                                    request_id,
+                                    response_time.as_millis()
+                                ));
                             }
                             Err(_) => {
-                                results.push(format!("req_{}_{}: timeout_{}ms",
-                                                   client_id, request_id, response_time.as_millis()));
+                                results.push(format!(
+                                    "req_{}_{}: timeout_{}ms",
+                                    client_id,
+                                    request_id,
+                                    response_time.as_millis()
+                                ));
                             }
                         }
                     }
@@ -218,10 +251,16 @@ async fn test_memory_pressure_simulation() {
 
     println!("Memory pressure test completed:");
     println!("  Total operations: {}", all_results.len());
-    println!("  Successful: {} ({:.1}%)", success_count,
-             (success_count as f64 / all_results.len() as f64) * 100.0);
-    println!("  Failed: {} ({:.1}%)", fail_count,
-             (fail_count as f64 / all_results.len() as f64) * 100.0);
+    println!(
+        "  Successful: {} ({:.1}%)",
+        success_count,
+        (success_count as f64 / all_results.len() as f64) * 100.0
+    );
+    println!(
+        "  Failed: {} ({:.1}%)",
+        fail_count,
+        (fail_count as f64 / all_results.len() as f64) * 100.0
+    );
 }
 
 #[tokio::test]
@@ -238,17 +277,18 @@ async fn test_connection_churn() {
 
         let stream_result = timeout(
             Duration::from_millis(200),
-            TcpStream::connect("127.0.0.1:20667")
-        ).await;
+            TcpStream::connect("127.0.0.1:20667"),
+        )
+        .await;
 
         match stream_result {
             Ok(Ok(mut stream)) => {
                 // Quick handshake attempt
                 let hello = encode_hello(5, "guest", "");
-                if timeout(
-                    Duration::from_millis(100),
-                    stream.write_all(&hello)
-                ).await.is_ok() {
+                if timeout(Duration::from_millis(100), stream.write_all(&hello))
+                    .await
+                    .is_ok()
+                {
                     successful_handshakes += 1;
                 }
                 // Immediately close connection (drop stream)
@@ -268,9 +308,15 @@ async fn test_connection_churn() {
     println!("Connection churn test completed:");
     println!("  Duration: {:?}", test_duration);
     println!("  Total connection attempts: {}", total_connections);
-    println!("  Successful handshakes: {} ({:.1}%)", successful_handshakes,
-             (successful_handshakes as f64 / total_connections as f64) * 100.0);
-    println!("  Connections/second: {:.1}", total_connections as f64 / test_duration.as_secs_f64());
+    println!(
+        "  Successful handshakes: {} ({:.1}%)",
+        successful_handshakes,
+        (successful_handshakes as f64 / total_connections as f64) * 100.0
+    );
+    println!(
+        "  Connections/second: {:.1}",
+        total_connections as f64 / test_duration.as_secs_f64()
+    );
 }
 
 #[tokio::test]
@@ -282,7 +328,10 @@ async fn test_gradual_load_increase() {
     let step_duration = Duration::from_secs(2);
 
     while current_concurrency <= max_concurrency {
-        println!("Testing with {} concurrent connections...", current_concurrency);
+        println!(
+            "Testing with {} concurrent connections...",
+            current_concurrency
+        );
 
         let mut handles = vec![];
         let start_time = Instant::now();
@@ -297,8 +346,9 @@ async fn test_gradual_load_increase() {
                 while Instant::now() < end_time {
                     let stream_result = timeout(
                         Duration::from_millis(500),
-                        TcpStream::connect("127.0.0.1:20667")
-                    ).await;
+                        TcpStream::connect("127.0.0.1:20667"),
+                    )
+                    .await;
 
                     match stream_result {
                         Ok(Ok(mut stream)) => {
@@ -352,8 +402,10 @@ async fn test_gradual_load_increase() {
             0.0
         };
 
-        println!("  Concurrency {}: {} requests, {:.1}% success rate",
-                current_concurrency, total_requests, success_rate);
+        println!(
+            "  Concurrency {}: {} requests, {:.1}% success rate",
+            current_concurrency, total_requests, success_rate
+        );
 
         // Stop if success rate drops too low
         if success_rate < 50.0 && current_concurrency > 1 {
@@ -365,7 +417,10 @@ async fn test_gradual_load_increase() {
         sleep(Duration::from_millis(500)).await; // Brief pause between steps
     }
 
-    println!("Gradual load increase test completed at concurrency level: {}", current_concurrency / 2);
+    println!(
+        "Gradual load increase test completed at concurrency level: {}",
+        current_concurrency / 2
+    );
 }
 
 #[tokio::test]
@@ -379,10 +434,10 @@ async fn test_large_payload_handling() {
     println!("Testing large payload handling...");
 
     let payload_sizes = vec![
-        64 * 1024,        // 64KB
-        512 * 1024,       // 512KB
-        1024 * 1024,      // 1MB
-        2 * 1024 * 1024,  // 2MB (if supported)
+        64 * 1024,       // 64KB
+        512 * 1024,      // 512KB
+        1024 * 1024,     // 1MB
+        2 * 1024 * 1024, // 2MB (if supported)
     ];
 
     for &size in &payload_sizes {
@@ -396,7 +451,10 @@ async fn test_large_payload_handling() {
         }
 
         let mut buf = [0u8; 1024];
-        if read_with_timeout(&mut stream, &mut buf, 1000).await.is_err() {
+        if read_with_timeout(&mut stream, &mut buf, 1000)
+            .await
+            .is_err()
+        {
             println!("  Handshake response failed, skipping");
             continue;
         }
@@ -413,8 +471,9 @@ async fn test_large_payload_handling() {
         let start_time = Instant::now();
         let write_result = timeout(
             Duration::from_millis(5000), // Longer timeout for large payloads
-            stream.write_all(&message)
-        ).await;
+            stream.write_all(&message),
+        )
+        .await;
 
         let write_time = start_time.elapsed();
 
@@ -463,24 +522,24 @@ async fn test_timeout_behavior_under_load() {
 
                 let stream_result = timeout(
                     Duration::from_millis(1000), // Shorter timeout to test timeout handling
-                    TcpStream::connect("127.0.0.1:20667")
-                ).await;
+                    TcpStream::connect("127.0.0.1:20667"),
+                )
+                .await;
 
                 match stream_result {
                     Ok(Ok(mut stream)) => {
                         // Send hello and wait for response with short timeout
                         let hello = encode_hello(5, "guest", "");
-                        let write_result = timeout(
-                            Duration::from_millis(200),
-                            stream.write_all(&hello)
-                        ).await;
+                        let write_result =
+                            timeout(Duration::from_millis(200), stream.write_all(&hello)).await;
 
                         if write_result.is_ok() {
                             let mut buf = [0u8; 64];
                             let read_result = timeout(
                                 Duration::from_millis(100), // Very short read timeout
-                                stream.read(&mut buf)
-                            ).await;
+                                stream.read(&mut buf),
+                            )
+                            .await;
 
                             match read_result {
                                 Ok(Ok(_)) => success_count += 1,
@@ -523,10 +582,16 @@ async fn test_timeout_behavior_under_load() {
 
     println!("Timeout behavior test completed:");
     println!("  Total operations: {}", total_operations);
-    println!("  Successful: {} ({:.1}%)", total_success,
-             (total_success as f64 / total_operations as f64) * 100.0);
-    println!("  Timeouts: {} ({:.1}%)", total_timeout,
-             (total_timeout as f64 / total_operations as f64) * 100.0);
+    println!(
+        "  Successful: {} ({:.1}%)",
+        total_success,
+        (total_success as f64 / total_operations as f64) * 100.0
+    );
+    println!(
+        "  Timeouts: {} ({:.1}%)",
+        total_timeout,
+        (total_timeout as f64 / total_operations as f64) * 100.0
+    );
 }
 
 #[tokio::test]
@@ -540,18 +605,16 @@ async fn test_resource_leak_detection() {
     while start_time.elapsed() < test_duration {
         let stream_result = timeout(
             Duration::from_millis(100),
-            TcpStream::connect("127.0.0.1:20667")
-        ).await;
+            TcpStream::connect("127.0.0.1:20667"),
+        )
+        .await;
 
         if let Ok(Ok(mut stream)) = stream_result {
             connection_count += 1;
 
             // Send minimal data and close
             let hello = encode_hello(5, "guest", "");
-            let _ = timeout(
-                Duration::from_millis(50),
-                stream.write_all(&hello)
-            ).await;
+            let _ = timeout(Duration::from_millis(50), stream.write_all(&hello)).await;
 
             // Connection is automatically closed when stream is dropped
         }
@@ -563,6 +626,9 @@ async fn test_resource_leak_detection() {
     println!("Resource leak test completed:");
     println!("  Duration: {:?}", test_duration);
     println!("  Connections created: {}", connection_count);
-    println!("  Connections/second: {:.1}", connection_count as f64 / test_duration.as_secs_f64());
+    println!(
+        "  Connections/second: {:.1}",
+        connection_count as f64 / test_duration.as_secs_f64()
+    );
     println!("  Note: Monitor server resources (memory, file handles) externally");
 }

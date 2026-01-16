@@ -38,10 +38,12 @@ pub struct ContextIndex {
     t_key_bins: sled::Tree,      // key -> Vec<KeyMd5Entry>
     t_version_stats: sled::Tree, // version_id -> VersionStats
     t_binary_meta: sled::Tree,   // md5 -> BinaryMeta
+    t_key_basenames: sled::Tree, // key -> Vec<String>
 }
 
 const MAX_MD5_PER_KEY: usize = 16;
 const MAX_MD5_PER_VERSION: usize = 16;
+const MAX_BASENAMES_PER_KEY: usize = 16;
 
 impl ContextIndex {
     pub fn new(db: &sled::Db) -> io::Result<Self> {
@@ -58,12 +60,16 @@ impl ContextIndex {
         let t_binary_meta = db
             .open_tree("ctx.binary_meta")
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {e}")));
+        let t_key_basenames = db
+            .open_tree("ctx.key_basenames")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {e}")));
         info!("context index initialized successfully");
         Ok(Self {
             t_key_md5: t_key_md5?,
             t_key_bins: t_key_bins?,
             t_version_stats: t_version_stats?,
             t_binary_meta: t_binary_meta?,
+            t_key_basenames: t_key_basenames?,
         })
     }
 
@@ -78,6 +84,7 @@ impl ContextIndex {
         hostname: &str,
         ts_sec: u64,
     ) -> io::Result<()> {
+        let clean_basename = sanitize_basename(basename);
         let key = md5;
         let val = self
             .t_binary_meta
@@ -104,8 +111,8 @@ impl ContextIndex {
         };
         meta.last_seen_ts = meta.last_seen_ts.max(ts_sec);
         meta.obs_count = meta.obs_count.saturating_add(1);
-        if meta.basename.is_empty() {
-            meta.basename = basename.to_string();
+        if meta.basename.is_empty() && !clean_basename.is_empty() {
+            meta.basename = clean_basename;
         }
         if meta.hostname.is_empty() {
             meta.hostname = hostname.to_string();
@@ -124,6 +131,7 @@ impl ContextIndex {
         md5: [u8; 16],
         version_id: Option<[u8; 32]>,
         ts_sec: u64,
+        basename: Option<&str>,
     ) -> io::Result<()> {
         let mut key_bytes = [0u8; 32];
         key_bytes[0..16].copy_from_slice(&key.to_le_bytes());
@@ -186,6 +194,10 @@ impl ContextIndex {
         self.t_key_bins
             .insert(&key_only, enc_bins)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled insert: {e}")))?;
+
+        if let Some(bn) = basename {
+            self.record_basename_for_key(key, bn)?;
+        }
 
         // version stats (if provided)
         if let Some(vid) = version_id {
@@ -291,6 +303,73 @@ impl ContextIndex {
                 format!("sled get: {e}"),
             )),
         }
+    }
+
+    pub fn get_basenames_for_key(&self, key: u128) -> io::Result<Vec<String>> {
+        let key_only = key.to_le_bytes();
+        match self.t_key_basenames.get(&key_only) {
+            Ok(Some(v)) => Ok(decode_basenames(&v).unwrap_or_default()),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("sled get: {e}"),
+            )),
+        }
+    }
+
+    pub fn resolve_basenames_for_key(&self, key: u128) -> io::Result<Vec<String>> {
+        let mut names = self.get_basenames_for_key(key)?;
+        let mut seen: std::collections::HashSet<String> = names.iter().cloned().collect();
+
+        if names.len() < MAX_BASENAMES_PER_KEY {
+            let md5_list = self.get_md5_bins_for_key(key)?;
+            for entry in md5_list.iter() {
+                if let Ok(Some(meta)) = self.get_binary_meta(&entry.md5) {
+                    if !meta.basename.is_empty()
+                        && seen.insert(meta.basename.clone())
+                        && names.len() < MAX_BASENAMES_PER_KEY
+                    {
+                        names.push(meta.basename);
+                    }
+                }
+            }
+        }
+
+        Ok(names)
+    }
+
+    fn record_basename_for_key(&self, key: u128, basename: &str) -> io::Result<()> {
+        let clean = sanitize_basename(basename);
+        if clean.is_empty() {
+            return Ok(());
+        }
+
+        let key_only = key.to_le_bytes();
+        let current = self
+            .t_key_basenames
+            .get(&key_only)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled get: {e}")))?;
+        let mut basenames = if let Some(v) = current {
+            decode_basenames(&v).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if !basenames
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(clean.as_str()))
+        {
+            basenames.insert(0, clean);
+            if basenames.len() > MAX_BASENAMES_PER_KEY {
+                basenames.truncate(MAX_BASENAMES_PER_KEY);
+            }
+            let enc = encode_basenames(&basenames);
+            self.t_key_basenames
+                .insert(&key_only, enc)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled insert: {e}")))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -476,4 +555,48 @@ fn decode_version_stats(mut b: &[u8]) -> Option<VersionStats> {
         num_binaries,
         top_md5s,
     })
+}
+
+fn encode_basenames(names: &[String]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + names.len() * 18);
+    v.push(names.len() as u8);
+    for name in names {
+        let b = name.as_bytes();
+        let len = (b.len().min(u16::MAX as usize)) as u16;
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(&b[..len as usize]);
+    }
+    v
+}
+
+fn decode_basenames(mut b: &[u8]) -> Option<Vec<String>> {
+    if b.is_empty() {
+        return Some(Vec::new());
+    }
+    let count = b[0] as usize;
+    b = &b[1..];
+
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = get_u16_le(&mut b)? as usize;
+        let bytes = get_bytes(&mut b, len)?;
+        let s = std::str::from_utf8(bytes).ok()?.to_string();
+        out.push(s);
+    }
+    Some(out)
+}
+
+fn sanitize_basename(input: &str) -> String {
+    let p = Path::new(input);
+    let base = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(input)
+        .trim()
+        .to_string();
+    if base.len() > 255 {
+        base[..255].to_string()
+    } else {
+        base
+    }
 }

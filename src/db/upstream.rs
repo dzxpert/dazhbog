@@ -1,15 +1,38 @@
+//! Upstream server communication for function metadata forwarding.
+
+use crate::api::metrics::METRICS;
 use crate::config::Upstream;
-use crate::lumina;
-use crate::metrics::METRICS;
+use crate::protocol::lumina;
 use log::*;
 use std::io;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
 
-/// Result element for each requested key: Some(pop,len,name,data) when found
+/// Result element for each requested key: Some(pop,len,name,data) when found.
 pub type UpItem = Option<(u32, u32, String, Vec<u8>)>;
 
-/// Connect to upstream server (plain TCP or TLS with optional insecure verification)
+/// Connection wrapper for upstream servers.
+enum UpstreamConn {
+    Plain(TcpStream),
+    Tls(tokio_native_tls::TlsStream<TcpStream>),
+}
+
+impl UpstreamConn {
+    async fn write(&mut self, typ: u8, payload: &[u8]) -> io::Result<()> {
+        match self {
+            UpstreamConn::Plain(s) => lumina::write_lumina_packet(s, typ, payload).await,
+            UpstreamConn::Tls(s) => lumina::write_lumina_packet(s, typ, payload).await,
+        }
+    }
+    async fn read(&mut self, max_len: usize) -> io::Result<(u8, Vec<u8>)> {
+        match self {
+            UpstreamConn::Plain(s) => lumina::read_lumina_packet(s, max_len).await,
+            UpstreamConn::Tls(s) => lumina::read_lumina_packet(s, max_len).await,
+        }
+    }
+}
+
+/// Connect to upstream server (plain TCP or TLS with optional insecure verification).
 async fn connect(up: &Upstream) -> io::Result<UpstreamConn> {
     let addr = format!("{}:{}", up.host, up.port);
     debug!("upstream: connecting to {}", addr);
@@ -50,27 +73,7 @@ async fn connect(up: &Upstream) -> io::Result<UpstreamConn> {
     }
 }
 
-enum UpstreamConn {
-    Plain(TcpStream),
-    Tls(tokio_native_tls::TlsStream<TcpStream>),
-}
-
-impl UpstreamConn {
-    async fn write(&mut self, typ: u8, payload: &[u8]) -> io::Result<()> {
-        match self {
-            UpstreamConn::Plain(s) => lumina::write_lumina_packet(s, typ, payload).await,
-            UpstreamConn::Tls(s) => lumina::write_lumina_packet(s, typ, payload).await,
-        }
-    }
-    async fn read(&mut self, max_len: usize) -> io::Result<(u8, Vec<u8>)> {
-        match self {
-            UpstreamConn::Plain(s) => lumina::read_lumina_packet(s, max_len).await,
-            UpstreamConn::Tls(s) => lumina::read_lumina_packet(s, max_len).await,
-        }
-    }
-}
-
-/// Parse license ID from JSON (format: "XX-YYYY-ZZZZ-WW" -> [0xXX, 0xYY, 0xYY, 0xZZ, 0xZZ, 0xWW])
+/// Parse license ID from JSON (format: "XX-YYYY-ZZZZ-WW" -> [0xXX, 0xYY, 0xYY, 0xZZ, 0xZZ, 0xWW]).
 fn parse_license_id(json_data: &[u8]) -> io::Result<[u8; 6]> {
     let json_str = std::str::from_utf8(json_data).map_err(|e| {
         io::Error::new(
@@ -125,7 +128,6 @@ fn parse_license_id(json_data: &[u8]) -> io::Result<[u8; 6]> {
 }
 
 /// Perform a Lumina hello to upstream.
-/// License is sent as license_data; lic_number is parsed from JSON.
 async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Result<()> {
     let lic_bytes: Vec<u8> = if let Some(ref path) = up.license_path {
         std::fs::read(path).map_err(|e| {
@@ -188,7 +190,7 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
             Err(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("upstream rejected hello with type 0x0b (failed to decode message)"),
+                    "upstream rejected hello with type 0x0b (failed to decode message)".to_string(),
                 ));
             }
         }
@@ -209,7 +211,7 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
 /// Tries servers in priority order (lower priority number = higher priority).
 /// Stops querying once all functions are found or all servers are exhausted.
 pub async fn fetch_from_upstreams(
-    upstreams: &[crate::config::Upstream],
+    upstreams: &[Upstream],
     keys: &[u128],
 ) -> io::Result<Vec<UpItem>> {
     if keys.is_empty() {
@@ -304,10 +306,7 @@ pub async fn fetch_from_upstreams(
 }
 
 /// Fetch missing items from a single upstream server. Returns vector aligned to `keys`.
-async fn fetch_from_single_upstream(
-    up: &crate::config::Upstream,
-    keys: &[u128],
-) -> io::Result<Vec<UpItem>> {
+async fn fetch_from_single_upstream(up: &Upstream, keys: &[u128]) -> io::Result<Vec<UpItem>> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -328,7 +327,7 @@ async fn fetch_from_single_upstream(
         let pull_payload = lumina::build_pull_metadata_payload(&arr);
 
         // Connect and handshake per batch to simplify code and resource usage
-        let mut conn = match connect(&up).await {
+        let mut conn = match connect(up).await {
             Ok(c) => c,
             Err(e) => {
                 METRICS
@@ -340,7 +339,7 @@ async fn fetch_from_single_upstream(
                 continue;
             }
         };
-        if let Err(e) = upstream_handshake(&mut conn, &up).await {
+        if let Err(e) = upstream_handshake(&mut conn, up).await {
             METRICS
                 .upstream_errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

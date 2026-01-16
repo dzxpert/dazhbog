@@ -1,102 +1,27 @@
+//! Main database implementation for function metadata storage.
+
+use crate::api::metrics::METRICS;
 use crate::config::Config;
 use crate::engine::{EngineRuntime, IndexError, Record, UpsertResult};
-use crate::util::{addr_off, addr_seg};
+use crate::engine::{SearchDocument, SearchHit};
+
+use super::failure_cache::FailureCache;
+use super::types::{FuncLatest, PushContext, QueryContext};
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::io;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{io};
 
-const FAILURE_CACHE_TTL_SECS: u64 = 86400; // 24 hours
-
-/// Thread-safe cache for tracking upstream fetch failures
-#[derive(Clone)]
-pub struct FailureCache {
-    inner: Arc<RwLock<FailureCacheInner>>,
-}
-
-struct FailureCacheInner {
-    // Maps key (symbol hash) to timestamp when failure was recorded
-    entries: HashMap<u128, u64>,
-}
-
-impl FailureCache {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(FailureCacheInner {
-                entries: HashMap::new(),
-            })),
-        }
-    }
-
-    /// Check if a key is in the failure cache and not expired
-    pub fn is_failed(&self, key: u128) -> bool {
-        let now = now_ts_sec();
-        if let Ok(cache) = self.inner.read() {
-            if let Some(&ts) = cache.entries.get(&key) {
-                // Check if entry has expired
-                if now - ts < FAILURE_CACHE_TTL_SECS {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Add a key to the failure cache with current timestamp
-    pub fn insert(&self, key: u128) {
-        let now = now_ts_sec();
-        if let Ok(mut cache) = self.inner.write() {
-            cache.entries.insert(key, now);
-        }
-    }
-
-    /// Remove a key from the failure cache
-    pub fn remove(&self, key: u128) {
-        if let Ok(mut cache) = self.inner.write() {
-            cache.entries.remove(&key);
-        }
-    }
-}
-
-fn now_ts_sec() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
+/// Main database handle for function metadata.
 #[derive(Clone)]
 pub struct Database {
     rt: Arc<EngineRuntime>,
     pub failure_cache: FailureCache,
 }
 
-#[derive(Debug, Clone)]
-pub struct FuncLatest {
-    pub popularity: u32,
-    pub len_bytes: u32,
-    pub name: String,
-    pub data: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PushContext<'a> {
-    pub md5: Option<[u8; 16]>,
-    pub basename: Option<&'a str>,
-    pub hostname: Option<&'a str>,
-}
-
-#[derive(Clone)]
-pub struct QueryContext<'a> {
-    pub keys: &'a [u128],
-    pub md5: Option<[u8; 16]>,
-    pub basename: Option<&'a str>,
-    #[allow(dead_code)]
-    pub hostname: Option<&'a str>,
-}
-
 impl Database {
+    /// Open or create a database with the given configuration.
     pub async fn open(cfg: Arc<Config>) -> io::Result<Arc<Self>> {
         let rt = EngineRuntime::open(cfg.engine.clone(), cfg.scoring.clone())?;
         Ok(Arc::new(Self {
@@ -105,6 +30,26 @@ impl Database {
         }))
     }
 
+    fn update_search_entry(&self, key: u128, name: &str, ts: u64) {
+        match self.rt.ctx_index.resolve_basenames_for_key(key) {
+            Ok(basenames) => {
+                let doc = SearchDocument {
+                    key,
+                    func_name: name.to_string(),
+                    binary_names: basenames,
+                    ts,
+                };
+                if let Err(e) = self.rt.search.index_function(&doc) {
+                    log::warn!("failed to update search index for key {:032x}: {}", key, e);
+                }
+            }
+            Err(e) => {
+                log::warn!("failed to gather basenames for key {:032x}: {}", key, e);
+            }
+        }
+    }
+
+    /// Get the latest version of a function by key.
     pub async fn get_latest(&self, key: u128) -> io::Result<Option<FuncLatest>> {
         let addr = self.rt.index.get(key);
         if addr == 0 {
@@ -129,6 +74,7 @@ impl Database {
         }))
     }
 
+    /// Push function metadata without context.
     pub async fn push(&self, items: &[(u128, u32, u32, &str, &[u8])]) -> io::Result<Vec<u32>> {
         let null_ctx = PushContext {
             md5: None,
@@ -138,6 +84,7 @@ impl Database {
         self.push_with_ctx(items, &null_ctx).await
     }
 
+    /// Push function metadata with context information.
     pub async fn push_with_ctx(
         &self,
         items: &[(u128, u32, u32, &str, &[u8])],
@@ -161,8 +108,8 @@ impl Database {
             let old = self.rt.index.get(*key);
 
             if old != 0 {
-                let seg_id = crate::util::addr_seg(old);
-                let off = crate::util::addr_off(old);
+                let seg_id = addr_seg(old);
+                let off = addr_off(old);
                 match self.rt.segments.get_reader(seg_id) {
                     Some(reader) => {
                         match reader.read_at(off) {
@@ -171,8 +118,8 @@ impl Database {
                                     status.push(2);
                                     // Still record context observation even if unchanged
                                     if let Some(md5) = ctx.md5 {
-                                        let ts = crate::util::now_ts_sec();
-                                        let vid = crate::util::version_id(*key, name, data);
+                                        let ts = now_ts_sec();
+                                        let vid = version_id(*key, name, data);
                                         let _ = self.rt.ctx_index.record_binary_meta(
                                             md5,
                                             ctx.basename.unwrap_or(""),
@@ -184,8 +131,10 @@ impl Database {
                                             md5,
                                             Some(vid),
                                             ts,
+                                            ctx.basename,
                                         );
                                     }
+                                    self.update_search_entry(*key, name, existing.ts_sec);
                                     continue;
                                 }
                             }
@@ -207,7 +156,7 @@ impl Database {
 
             let rec = Record {
                 key: *key,
-                ts_sec: crate::util::now_ts_sec(),
+                ts_sec: now_ts_sec(),
                 prev_addr: old,
                 len_bytes: (*data).len() as u32,
                 popularity: *pop,
@@ -220,13 +169,13 @@ impl Database {
                 Ok(UpsertResult::Inserted) => status.push(1),
                 Ok(UpsertResult::Replaced(_)) => status.push(0),
                 Err(IndexError::Full) => {
-                    crate::metrics::METRICS
+                    METRICS
                         .append_failures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Err(io::Error::new(io::ErrorKind::Other, "index full"));
                 }
                 Err(IndexError::Io(e)) => {
-                    crate::metrics::METRICS
+                    METRICS
                         .append_failures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Err(io::Error::new(
@@ -238,29 +187,34 @@ impl Database {
 
             if let Some(md5) = ctx.md5 {
                 let ts = rec.ts_sec;
-                let vid = crate::util::version_id(*key, name, data);
+                let vid = version_id(*key, name, data);
                 let _ = self.rt.ctx_index.record_binary_meta(
                     md5,
                     ctx.basename.unwrap_or(""),
                     ctx.hostname.unwrap_or(""),
                     ts,
                 );
-                let _ = self
-                    .rt
-                    .ctx_index
-                    .record_key_observation(*key, md5, Some(vid), ts);
+                let _ = self.rt.ctx_index.record_key_observation(
+                    *key,
+                    md5,
+                    Some(vid),
+                    ts,
+                    ctx.basename,
+                );
             }
+            self.update_search_entry(*key, name, rec.ts_sec);
         }
         Ok(status)
     }
 
+    /// Delete function metadata by keys.
     pub async fn delete_keys(&self, keys: &[u128]) -> io::Result<u32> {
         let mut deleted = 0u32;
         for &key in keys {
             let old = self.rt.index.get(key);
             let rec = Record {
                 key,
-                ts_sec: crate::util::now_ts_sec(),
+                ts_sec: now_ts_sec(),
                 prev_addr: old,
                 len_bytes: 0,
                 popularity: 0,
@@ -270,6 +224,7 @@ impl Database {
             };
             let addr = self.rt.segments.append(&rec)?;
             let _ = self.rt.index.upsert(key, addr);
+            let _ = self.rt.search.delete(key);
             if old != 0 {
                 deleted += 1;
             }
@@ -277,6 +232,7 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Get function history by key.
     pub async fn get_history(
         &self,
         key: u128,
@@ -303,18 +259,24 @@ impl Database {
         Ok(out)
     }
 
+    /// Search functions by query string.
+    pub async fn search_functions(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
+        self.rt.search.search(query, limit)
+    }
+
+    /// Select best versions for a batch of keys using scoring.
     pub async fn select_versions_for_batch(
         &self,
         ctx: &QueryContext<'_>,
     ) -> io::Result<Vec<Option<(u32, u32, String, Vec<u8>)>>> {
         use std::time::Instant;
-        crate::metrics::METRICS
+        METRICS
             .scoring_batches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let start = Instant::now();
 
         if self.rt.ctx_index.approx_is_empty() {
-            crate::metrics::METRICS
+            METRICS
                 .scoring_fallback_latest
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut out = Vec::with_capacity(ctx.keys.len());
@@ -325,7 +287,7 @@ impl Database {
                         .map(|f| (f.popularity, f.len_bytes, f.name, f.data)),
                 );
             }
-            crate::metrics::METRICS.scoring_time_ns.fetch_add(
+            METRICS.scoring_time_ns.fetch_add(
                 start.elapsed().as_nanos() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
@@ -360,7 +322,7 @@ impl Database {
         for &k in ctx.keys {
             // Walk history up to cap
             let cap = self.rt.scoring.max_versions_per_key;
-            let mut versions: Vec<(crate::engine::Record, [u8; 32])> = Vec::new();
+            let mut versions: Vec<(Record, [u8; 32])> = Vec::new();
             let mut addr = self.rt.index.get(k);
             let mut seen_addrs = HashSet::new();
             while addr != 0 && versions.len() < cap && !seen_addrs.contains(&addr) {
@@ -374,7 +336,7 @@ impl Database {
                 match reader.read_at(off) {
                     Ok(rec) => {
                         if rec.flags & 0x01 == 0 {
-                            let vid = crate::util::version_id(k, &rec.name, &rec.data);
+                            let vid = version_id(k, &rec.name, &rec.data);
                             versions.push((rec.clone(), vid));
                         }
                         addr = rec.prev_addr;
@@ -535,8 +497,7 @@ impl Database {
                     best_score = score;
                     best_idx = idx;
                 } else if (score - best_score).abs() < 1e-12 {
-                    // tie-breakers: prefer md5 match, then coh, then stab, then newer
-                    // recompute minimal signals used for tiebreak quickly
+                    // tie-breakers: prefer md5 match, then newer
                     let mut cur_md5 = 0.0f64;
                     if let Some(md5q) = ctx.md5 {
                         if let Some(st) = self.rt.ctx_index.get_key_md5_stats(k, &md5q)? {
@@ -573,18 +534,51 @@ impl Database {
             )));
         }
 
-        crate::metrics::METRICS
-            .scoring_versions_considered
-            .fetch_add(
-                versions_considered_total,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        crate::metrics::METRICS.scoring_time_ns.fetch_add(
+        METRICS.scoring_versions_considered.fetch_add(
+            versions_considered_total,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        METRICS.scoring_time_ns.fetch_add(
             start.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
         Ok(results)
     }
+}
+
+// Helper functions
+
+fn now_ts_sec() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Extract segment ID from address.
+const fn addr_seg(addr: u64) -> u16 {
+    (addr >> 48) as u16
+}
+
+/// Extract offset from address.
+const fn addr_off(addr: u64) -> u64 {
+    addr & 0x0000_FFFF_FFFF_FFFF
+}
+
+/// Compute version ID from key, name, and data.
+fn version_id(key: u128, name: &str, data: &[u8]) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    name.hash(&mut h);
+    data.hash(&mut h);
+    let hash = h.finish();
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&key.to_le_bytes()[0..8]);
+    out[8..16].copy_from_slice(&key.to_le_bytes()[8..16]);
+    out[16..24].copy_from_slice(&hash.to_le_bytes());
+    out[24..32].copy_from_slice(&(name.len() as u64).to_le_bytes());
+    out
 }
 
 fn name_suffix_similarity(a: &str, b: &str) -> f64 {

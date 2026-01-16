@@ -1,0 +1,126 @@
+//! HTTP request handlers.
+
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{body::Incoming, header, Request, Response, StatusCode};
+use log::*;
+use percent_encoding::percent_decode_str;
+use serde::Serialize;
+use std::sync::Arc;
+
+use crate::api::metrics::METRICS;
+use crate::db::Database;
+use crate::engine::SearchHit;
+
+/// Search response structure.
+#[derive(Serialize)]
+pub struct SearchResponse {
+    query: String,
+    results: Vec<SearchHit>,
+}
+
+/// Metrics snapshot for JSON API.
+#[derive(Serialize)]
+pub struct MetricsSnapshot {
+    pulls: u64,
+    pushes: u64,
+    new_funcs: u64,
+    queried_funcs: u64,
+    active_connections: u64,
+    errors: u64,
+    timeouts: u64,
+    index_overflows: u64,
+    append_failures: u64,
+    decoder_rejects: u64,
+    upstream_requests: u64,
+    upstream_errors: u64,
+    scoring_batches: u64,
+    scoring_versions_considered: u64,
+}
+
+/// Get current metrics snapshot.
+pub fn metrics_snapshot() -> MetricsSnapshot {
+    use std::sync::atomic::Ordering::Relaxed;
+    MetricsSnapshot {
+        pulls: METRICS.pulls.load(Relaxed),
+        pushes: METRICS.pushes.load(Relaxed),
+        new_funcs: METRICS.new_funcs.load(Relaxed),
+        queried_funcs: METRICS.queried_funcs.load(Relaxed),
+        active_connections: METRICS.active_connections.load(Relaxed),
+        errors: METRICS.errors.load(Relaxed),
+        timeouts: METRICS.timeouts.load(Relaxed),
+        index_overflows: METRICS.index_overflows.load(Relaxed),
+        append_failures: METRICS.append_failures.load(Relaxed),
+        decoder_rejects: METRICS.decoder_rejects.load(Relaxed),
+        upstream_requests: METRICS.upstream_requests.load(Relaxed),
+        upstream_errors: METRICS.upstream_errors.load(Relaxed),
+        scoring_batches: METRICS.scoring_batches.load(Relaxed),
+        scoring_versions_considered: METRICS.scoring_versions_considered.load(Relaxed),
+    }
+}
+
+/// Parse a query parameter from a request.
+pub fn parse_query_param(req: &Request<Incoming>, key: &str) -> Option<String> {
+    let query = req.uri().query()?;
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next()?;
+        if k == key {
+            let raw = it.next().unwrap_or_default();
+            return percent_decode_str(raw)
+                .decode_utf8()
+                .ok()
+                .map(|s| s.into_owned());
+        }
+    }
+    None
+}
+
+/// Create a JSON response.
+pub fn json_response<T: Serialize>(value: &T, status: StatusCode) -> Response<Full<Bytes>> {
+    match serde_json::to_vec(value) {
+        Ok(body) => {
+            let mut r = Response::new(Full::new(Bytes::from(body)));
+            *r.status_mut() = status;
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            r
+        }
+        Err(e) => {
+            error!("json serialize error: {}", e);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from_static(
+                    b"{\"error\":\"serialization\"}",
+                )))
+                .unwrap()
+        }
+    }
+}
+
+/// Handle search API request.
+pub async fn handle_search(db: Arc<Database>, req: Request<Incoming>) -> Response<Full<Bytes>> {
+    let Some(q) = parse_query_param(&req, "q") else {
+        return json_response(
+            &serde_json::json!({"error": "missing query"}),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let limit = parse_query_param(&req, "limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(100))
+        .unwrap_or(25);
+
+    match db.search_functions(&q, limit).await {
+        Ok(results) => json_response(&SearchResponse { query: q, results }, StatusCode::OK),
+        Err(e) => {
+            error!("search failed: {}", e);
+            json_response(
+                &serde_json::json!({"error": "search failed"}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    }
+}

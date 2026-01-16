@@ -1,5 +1,5 @@
-use std::{io, path::PathBuf};
 use chrono::{DateTime, Utc};
+use std::{io, path::PathBuf};
 
 const MAGIC: u32 = 0x4C4D4E31;
 
@@ -192,19 +192,37 @@ fn print_record(idx: usize, offset: u64, rec: &Record) {
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
 
     println!("┌─────────────────────────────────────────────────────────────────────────────┐");
-    println!("│ FUNCTION #{:<2}                                                              │", idx + 1);
+    println!(
+        "│ FUNCTION #{:<2}                                                              │",
+        idx + 1
+    );
     println!("├─────────────────────────────────────────────────────────────────────────────┤");
-    println!("│ Key (MD5):     {:032x}                                    │", rec.key);
+    println!(
+        "│ Key (MD5):     {:032x}                                    │",
+        rec.key
+    );
     println!("│ Name:          {:<60} │", truncate_string(&rec.name, 60));
-    println!("│ Offset:        0x{:016x}                                          │", offset);
-    println!("│ Timestamp:     {} ({})", dt.format("%Y-%m-%d %H:%M:%S UTC"), rec.ts_sec);
+    println!(
+        "│ Offset:        0x{:016x}                                          │",
+        offset
+    );
+    println!(
+        "│ Timestamp:     {} ({})",
+        dt.format("%Y-%m-%d %H:%M:%S UTC"),
+        rec.ts_sec
+    );
     println!("│ Popularity:    {:<60} │", rec.popularity);
     println!("│ Length:        {} bytes{:<51} │", rec.len_bytes, "");
     println!("│ Data Size:     {} bytes{:<51} │", rec.data.len(), "");
     println!("│ Prev Address:  0x{:016x}{:<42} │", rec.prev_addr, "");
-    println!("│ Flags:         0x{:02x} {}                    │",
+    println!(
+        "│ Flags:         0x{:02x} {}                    │",
         rec.flags,
-        if rec.flags & 0x01 != 0 { "(TOMBSTONE)" } else { "(ACTIVE)    " }
+        if rec.flags & 0x01 != 0 {
+            "(TOMBSTONE)"
+        } else {
+            "(ACTIVE)    "
+        }
     );
     println!("├─────────────────────────────────────────────────────────────────────────────┤");
     println!("│ DATA HEXDUMP:                                                               │");

@@ -3,14 +3,19 @@
 //! This module tests various edge cases and boundary conditions that could
 //! reveal security issues or robustness problems.
 
-use std::time::Duration;
-use tokio::time::timeout;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rand::{Rng, RngCore};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 async fn connect_to_server() -> Option<TcpStream> {
-    match timeout(Duration::from_secs(1), TcpStream::connect("127.0.0.1:20667")).await {
+    match timeout(
+        Duration::from_secs(1),
+        TcpStream::connect("127.0.0.1:20667"),
+    )
+    .await
+    {
         Ok(Ok(stream)) => Some(stream),
         _ => {
             eprintln!("Server not running on 127.0.0.1:20667, skipping boundary tests");
@@ -43,7 +48,10 @@ async fn read_with_timeout<R: AsyncReadExt + Unpin>(
 ) -> std::io::Result<usize> {
     match timeout(Duration::from_millis(timeout_ms), reader.read(buf)).await {
         Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout")),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "read timeout",
+        )),
     }
 }
 
@@ -88,10 +96,7 @@ async fn test_numeric_boundaries() {
         println!("Testing numeric boundary: {}", description);
 
         let hello = encode_hello(version, username, password);
-        let write_result = timeout(
-            Duration::from_millis(1000),
-            stream.write_all(&hello)
-        ).await;
+        let write_result = timeout(Duration::from_millis(1000), stream.write_all(&hello)).await;
 
         match write_result {
             Ok(Ok(_)) => {
@@ -127,7 +132,11 @@ async fn test_unicode_and_encoding_edges() {
         ("test", "Unicode: русский", "Unicode Russian"),
         ("test", "Unicode: 🔥💯", "Unicode symbols"),
         // Control characters
-        ("test", "Control: \x00\x01\x02", "Control characters in password"),
+        (
+            "test",
+            "Control: \x00\x01\x02",
+            "Control characters in password",
+        ),
         ("Control: \n\r\t", "test", "Control characters in username"),
         // High Unicode codepoints
         ("test", &high_unicode, "Highest Unicode codepoint"),
@@ -139,10 +148,7 @@ async fn test_unicode_and_encoding_edges() {
         println!("Testing encoding: {}", description);
 
         let hello = encode_hello(5, username, password);
-        let write_result = timeout(
-            Duration::from_millis(1000),
-            stream.write_all(&hello)
-        ).await;
+        let write_result = timeout(Duration::from_millis(1000), stream.write_all(&hello)).await;
 
         match write_result {
             Ok(Ok(_)) => {
@@ -178,25 +184,37 @@ async fn test_frame_size_edge_cases() {
         (2u32, 0x01, vec![0x00], "Frame with 1 byte data"),
         // Boundary size frames
         (4u32, 0x01, vec![0x00, 0x00, 0x00], "4-byte frame boundary"),
-        (5u32, 0x01, vec![0x00, 0x00, 0x00, 0x00], "5-byte frame boundary"),
+        (
+            5u32,
+            0x01,
+            vec![0x00, 0x00, 0x00, 0x00],
+            "5-byte frame boundary",
+        ),
         // Large but valid frames
         (1000u32, 0x01, vec![0xAA; 999], "Large valid frame"),
         // Random size frames
         {
             let size = rng.gen_range(1..1000);
-            (size, 0x01, vec![0xBB; size as usize - 1], "Random size frame")
+            (
+                size,
+                0x01,
+                vec![0xBB; size as usize - 1],
+                "Random size frame",
+            )
         },
     ];
 
     for (len_field, msg_type, payload, description) in frame_size_tests {
-        println!("Testing frame size: {} (len={}, type=0x{:02x}, payload={})",
-                description, len_field, msg_type, payload.len());
+        println!(
+            "Testing frame size: {} (len={}, type=0x{:02x}, payload={})",
+            description,
+            len_field,
+            msg_type,
+            payload.len()
+        );
 
         let frame = raw_frame(len_field, msg_type, &payload);
-        let write_result = timeout(
-            Duration::from_millis(1000),
-            stream.write_all(&frame)
-        ).await;
+        let write_result = timeout(Duration::from_millis(1000), stream.write_all(&frame)).await;
 
         match write_result {
             Ok(Ok(_)) => {
@@ -229,8 +247,9 @@ async fn test_timing_and_race_conditions() {
         let hello = encode_hello(5, "guest", "");
         let write_result = timeout(
             Duration::from_millis(10), // Very short timeout
-            stream.write_all(&hello)
-        ).await;
+            stream.write_all(&hello),
+        )
+        .await;
 
         if write_result.is_err() {
             println!("  Write {} failed due to timeout", i);
@@ -291,10 +310,8 @@ async fn test_state_machine_edges() {
         println!("Testing state machine edges: test {}", test_id);
 
         for message in messages {
-            let write_result = timeout(
-                Duration::from_millis(200),
-                stream.write_all(&message)
-            ).await;
+            let write_result =
+                timeout(Duration::from_millis(200), stream.write_all(&message)).await;
 
             match write_result {
                 Ok(Ok(_)) => {
@@ -326,26 +343,33 @@ async fn test_resource_exhaustion_edges() {
     let exhaustion_tests = vec![
         // Maximum connections would be tested separately
         // Here we test per-connection resource limits
-        ("Many small messages", (0..1000).map(|i| raw_frame(5, 0x01, &[i as u8])).collect()),
-        ("Alternating large/small", vec![
-            raw_frame(1000, 0x01, &vec![0xAA; 999]),
-            raw_frame(5, 0x01, &[0xBB]),
-            raw_frame(1000, 0x01, &vec![0xCC; 999]),
-            raw_frame(5, 0x01, &[0xDD]),
-        ]),
-        ("Maximum message size boundary", vec![
-            raw_frame(65535, 0x01, &vec![0xFF; 65534]), // Near max u16
-        ]),
+        (
+            "Many small messages",
+            (0..1000).map(|i| raw_frame(5, 0x01, &[i as u8])).collect(),
+        ),
+        (
+            "Alternating large/small",
+            vec![
+                raw_frame(1000, 0x01, &vec![0xAA; 999]),
+                raw_frame(5, 0x01, &[0xBB]),
+                raw_frame(1000, 0x01, &vec![0xCC; 999]),
+                raw_frame(5, 0x01, &[0xDD]),
+            ],
+        ),
+        (
+            "Maximum message size boundary",
+            vec![
+                raw_frame(65535, 0x01, &vec![0xFF; 65534]), // Near max u16
+            ],
+        ),
     ];
 
     for (description, messages) in exhaustion_tests {
         println!("Testing resource exhaustion: {}", description);
 
         for message in messages {
-            let write_result = timeout(
-                Duration::from_millis(500),
-                stream.write_all(&message)
-            ).await;
+            let write_result =
+                timeout(Duration::from_millis(500), stream.write_all(&message)).await;
 
             match write_result {
                 Ok(Ok(_)) => {
@@ -400,10 +424,7 @@ async fn test_endianness_and_byte_order() {
     for (test_id, message) in endian_tests.into_iter().enumerate() {
         println!("Testing endianness: test {}", test_id);
 
-        let write_result = timeout(
-            Duration::from_millis(1000),
-            stream.write_all(&message)
-        ).await;
+        let write_result = timeout(Duration::from_millis(1000), stream.write_all(&message)).await;
 
         match write_result {
             Ok(Ok(_)) => {
@@ -432,22 +453,29 @@ async fn test_memory_alignment_and_layout() {
     let layout_tests = vec![
         // Messages sized to test alignment
         raw_frame(8, 0x01, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]), // 8-byte aligned
-        raw_frame(16, 0x01, &vec![0x10; 15]), // 16-byte aligned
-        raw_frame(32, 0x01, &vec![0x20; 31]), // 32-byte aligned
-        raw_frame(64, 0x01, &vec![0x40; 63]), // 64-byte aligned
+        raw_frame(16, 0x01, &vec![0x10; 15]),                            // 16-byte aligned
+        raw_frame(32, 0x01, &vec![0x20; 31]),                            // 32-byte aligned
+        raw_frame(64, 0x01, &vec![0x40; 63]),                            // 64-byte aligned
         // Messages with specific patterns that might cause issues
-        raw_frame(13, 0x01, &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x13, 0x37, 0x00, 0xFF]), // Magic values
+        raw_frame(
+            13,
+            0x01,
+            &[
+                0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x13, 0x37, 0x00, 0xFF,
+            ],
+        ), // Magic values
         raw_frame(7, 0x01, &[0x00; 6]), // All zeros
         raw_frame(9, 0x01, &[0xFF; 8]), // All ones
     ];
 
     for (test_id, message) in layout_tests.into_iter().enumerate() {
-        println!("Testing memory layout: test {} (size: {})", test_id, message.len());
+        println!(
+            "Testing memory layout: test {} (size: {})",
+            test_id,
+            message.len()
+        );
 
-        let write_result = timeout(
-            Duration::from_millis(1000),
-            stream.write_all(&message)
-        ).await;
+        let write_result = timeout(Duration::from_millis(1000), stream.write_all(&message)).await;
 
         match write_result {
             Ok(Ok(_)) => {
@@ -477,18 +505,18 @@ async fn test_error_recovery_and_robustness() {
         // Invalid data followed by valid hello
         vec![
             raw_frame(u32::MAX, 0xFF, &vec![0xFF; 1000]), // Completely invalid
-            encode_hello(5, "guest", ""), // Valid hello
+            encode_hello(5, "guest", ""),                 // Valid hello
         ],
         // Partial messages followed by complete ones
         vec![
-            vec![0x00, 0x00, 0x00], // Partial length field
+            vec![0x00, 0x00, 0x00],       // Partial length field
             encode_hello(5, "guest", ""), // Complete message
         ],
         // Corrupted messages mixed with valid ones
         vec![
             raw_frame(10, 0x01, b"corrupted"), // Corrupted hello
-            encode_hello(5, "guest", ""), // Valid hello
-            raw_frame(5, 0x10, &[0x00]), // Valid pull request
+            encode_hello(5, "guest", ""),      // Valid hello
+            raw_frame(5, 0x10, &[0x00]),       // Valid pull request
         ],
     ];
 
@@ -496,10 +524,8 @@ async fn test_error_recovery_and_robustness() {
         println!("Testing error recovery: test {}", test_id);
 
         for message in message_sequence {
-            let write_result = timeout(
-                Duration::from_millis(1000),
-                stream.write_all(&message)
-            ).await;
+            let write_result =
+                timeout(Duration::from_millis(1000), stream.write_all(&message)).await;
 
             match write_result {
                 Ok(Ok(_)) => {

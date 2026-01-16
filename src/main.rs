@@ -1,22 +1,18 @@
 #![deny(clippy::all)]
 #![warn(unused_crate_dependencies)]
 
-mod codec;
+mod api;
+mod common;
 mod config;
 mod db;
 mod engine;
-mod http;
-mod lumina;
-mod metrics;
-mod rpc;
-mod server;
-mod upstream;
-mod util;
+mod net;
+mod protocol;
 
+use crate::api::http::serve_http;
+use crate::api::metrics::METRICS;
 use crate::config::Config;
-use crate::http::serve_http;
-use crate::metrics::METRICS;
-use crate::server::serve_binary_rpc;
+use crate::net::serve_binary_rpc;
 
 use log::*;
 use std::sync::Arc;

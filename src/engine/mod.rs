@@ -1,10 +1,12 @@
 mod context_index;
 mod crc32c;
 mod index;
+pub mod search;
 mod segment;
 
 pub use context_index::ContextIndex;
 pub use index::{migrate_legacy_index_files, IndexError, ShardedIndex, UpsertResult};
+pub use search::{rebuild_from_engine, SearchDocument, SearchHit, SearchIndex};
 pub use segment::{OpenSegments, Record};
 
 use crate::config::{Engine, Scoring};
@@ -17,6 +19,7 @@ pub struct EngineRuntime {
     pub segments: Arc<OpenSegments>,
     pub index: Arc<ShardedIndex>,
     pub ctx_index: Arc<ContextIndex>,
+    pub search: Arc<SearchIndex>,
     #[allow(dead_code)]
     pub cfg: Engine,
     #[allow(dead_code)]
@@ -58,12 +61,18 @@ impl EngineRuntime {
         }
 
         let ctx_index = Arc::new(ContextIndex::new(&index_db)?);
+        let search_dir = dir.join("search_index");
+        let search = Arc::new(SearchIndex::open(&search_dir)?);
+        if search.is_empty()? {
+            rebuild_from_engine(&search, &segments, &index, &ctx_index)?;
+        }
 
         Ok(Self {
             dir,
             segments,
             index,
             ctx_index,
+            search,
             cfg,
             scoring,
         })
