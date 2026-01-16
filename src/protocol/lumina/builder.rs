@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::wire::*;
 
-/// Write a packet in Lumina format.
+/// Write a packet in Lumina format with chunking for large payloads.
 pub async fn write_lumina_packet<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     msg_type: u8,
@@ -21,8 +21,36 @@ pub async fn write_lumina_packet<W: AsyncWriteExt + Unpin>(
     );
     w.write_all(&len_bytes).await?;
     w.write_u8(msg_type).await?;
-    w.write_all(payload).await?;
+
+    // Write payload in chunks with yield points for large responses
+    write_all_chunked(w, payload).await?;
+
     w.flush().await?;
+    Ok(())
+}
+
+/// Write bytes in chunks with yield points to prevent worker thread starvation.
+async fn write_all_chunked<W: AsyncWriteExt + Unpin>(w: &mut W, buf: &[u8]) -> io::Result<()> {
+    const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+
+    if buf.len() <= CHUNK_SIZE {
+        // Small write, no need to chunk
+        return w.write_all(buf).await;
+    }
+
+    // Large write - chunk it and yield between chunks
+    let mut offset = 0;
+    while offset < buf.len() {
+        let end = (offset + CHUNK_SIZE).min(buf.len());
+        w.write_all(&buf[offset..end]).await?;
+        offset = end;
+
+        // Yield to the runtime to allow other tasks to run
+        if offset < buf.len() {
+            tokio::task::yield_now().await;
+        }
+    }
+
     Ok(())
 }
 

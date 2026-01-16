@@ -3,6 +3,23 @@
 use super::types::{SearchDocument, SearchHit};
 use std::{io, path::Path};
 use tantivy::collector::TopDocs;
+
+/// Extract only the filename from a path, stripping directories.
+/// Prevents leaking usernames or directory structures in API responses.
+fn sanitize_basename(input: &str) -> String {
+    let p = Path::new(input);
+    let base = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(input)
+        .trim()
+        .to_string();
+    if base.len() > 255 {
+        base[..255].to_string()
+    } else {
+        base
+    }
+}
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED};
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer};
@@ -180,7 +197,11 @@ impl SearchIndex {
             let mut binary_names = Vec::new();
             for v in doc.get_all(self.fields.binary_name) {
                 if let Some(t) = v.as_text() {
-                    binary_names.push(t.to_string());
+                    // Sanitize: extract only the filename to prevent leaking paths/usernames
+                    let sanitized = sanitize_basename(t);
+                    if !sanitized.is_empty() {
+                        binary_names.push(sanitized);
+                    }
                 }
             }
             hits.push(SearchHit {

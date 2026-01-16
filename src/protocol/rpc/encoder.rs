@@ -6,10 +6,35 @@ use tokio::io::AsyncWriteExt;
 use super::{MSG_DEL_OK, MSG_FAIL, MSG_HELLO_OK, MSG_HIST_OK, MSG_OK, MSG_PULL_OK, MSG_PUSH_OK};
 use crate::protocol::codec::{frame, put_bytes, put_str};
 
-/// Write all bytes and flush.
+/// Write all bytes and flush, using chunking for large buffers.
 pub async fn write_all<W: AsyncWriteExt + Unpin>(w: &mut W, buf: &[u8]) -> std::io::Result<()> {
-    w.write_all(buf).await?;
+    write_all_chunked(w, buf).await?;
     w.flush().await
+}
+
+/// Write bytes in chunks with yield points to prevent worker thread starvation.
+async fn write_all_chunked<W: AsyncWriteExt + Unpin>(w: &mut W, buf: &[u8]) -> std::io::Result<()> {
+    const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+
+    if buf.len() <= CHUNK_SIZE {
+        // Small write, no need to chunk
+        return w.write_all(buf).await;
+    }
+
+    // Large write - chunk it and yield between chunks
+    let mut offset = 0;
+    while offset < buf.len() {
+        let end = (offset + CHUNK_SIZE).min(buf.len());
+        w.write_all(&buf[offset..end]).await?;
+        offset = end;
+
+        // Yield to the runtime to allow other tasks to run
+        if offset < buf.len() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    Ok(())
 }
 
 /// Encode an OK response.

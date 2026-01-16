@@ -99,8 +99,7 @@ fn print_help() {
     println!("    dazhbog --help                            # Show this help");
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let mut args = std::env::args().skip(1);
 
     // Check for help flag
@@ -118,7 +117,7 @@ async fn main() {
         let cfg = Arc::new(cfg);
         info!("config loaded from {}", arg);
 
-        run_server(cfg).await;
+        run_server(cfg);
     } else {
         // Use default config.toml
         setup_logger();
@@ -129,44 +128,83 @@ async fn main() {
         let cfg = Arc::new(cfg);
         info!("config loaded from config.toml");
 
-        run_server(cfg).await;
+        run_server(cfg);
     }
 }
 
-async fn run_server(cfg: Arc<Config>) {
-    let db = db::Database::open(cfg.clone()).await.unwrap_or_else(|e| {
-        eprintln!("failed to open storage: {e}");
-        std::process::exit(1);
+fn run_server(cfg: Arc<Config>) {
+    // Create a small runtime just for initialization
+    let init_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build init runtime");
+
+    let db = init_runtime.block_on(async {
+        db::Database::open(cfg.clone()).await.unwrap_or_else(|e| {
+            eprintln!("failed to open storage: {e}");
+            std::process::exit(1);
+        })
     });
 
-    let http_task = {
+    // Create separate runtime for RPC server with more worker threads
+    // RPC handles large responses and needs more parallelism
+    let rpc_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(16) // Increased worker threads for RPC
+        .thread_name("rpc-worker")
+        .enable_all()
+        .build()
+        .expect("failed to build RPC runtime");
+
+    // Create separate runtime for HTTP server
+    // HTTP needs to stay responsive and gets its own dedicated pool
+    let http_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4) // Smaller pool for HTTP (lighter load)
+        .thread_name("http-worker")
+        .enable_all()
+        .build()
+        .expect("failed to build HTTP runtime");
+
+    info!("Created separate runtimes: RPC (16 workers), HTTP (4 workers)");
+
+    // Spawn HTTP server on its dedicated runtime
+    let _http_handle = {
         let cfg = cfg.clone();
         let db = db.clone();
-        tokio::spawn(async move {
-            serve_http(cfg, db).await;
+        std::thread::spawn(move || {
+            http_runtime.block_on(async move {
+                serve_http(cfg, db).await;
+            });
         })
     };
 
-    let rpc_task = {
+    // Spawn RPC server on its dedicated runtime
+    let _rpc_handle = {
         let cfg = cfg.clone();
         let db = db.clone();
-        tokio::spawn(async move {
-            serve_binary_rpc(cfg, db).await;
+        std::thread::spawn(move || {
+            rpc_runtime.block_on(async move {
+                serve_binary_rpc(cfg, db).await;
+            });
         })
     };
 
     info!("dazhbog server started; press Ctrl-C to stop.");
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl-C handler");
+
+    // Wait for Ctrl-C in the init runtime
+    init_runtime.block_on(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    });
+
     info!("shutting down...");
 
     METRICS
         .shutting_down
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
-    rpc_task.abort();
-    http_task.abort();
+    // Note: threads will be forcefully terminated when main exits
+    // For graceful shutdown, we'd need to implement cancellation tokens
 
     info!("Goodbye.");
 }

@@ -28,7 +28,38 @@ use super::frame::read_multiproto_bounded;
 /// Write all bytes to the stream.
 #[inline]
 pub async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> io::Result<()> {
-    w.write_all(buf).await
+    write_all_chunked(w, buf).await
+}
+
+/// Write bytes in chunks with yield points to prevent worker thread starvation.
+///
+/// When writing large responses (e.g., megabytes of Lumina metadata), this function
+/// breaks the write into chunks and yields to the tokio runtime between chunks.
+/// This ensures that other tasks (like HTTP requests) can be processed even when
+/// multiple large writes are in progress.
+async fn write_all_chunked<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> io::Result<()> {
+    const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+
+    if buf.len() <= CHUNK_SIZE {
+        // Small write, no need to chunk
+        return w.write_all(buf).await;
+    }
+
+    // Large write - chunk it and yield between chunks
+    let mut offset = 0;
+    while offset < buf.len() {
+        let end = (offset + CHUNK_SIZE).min(buf.len());
+        w.write_all(&buf[offset..end]).await?;
+        offset = end;
+
+        // Yield to the runtime to allow other tasks to run
+        // This is critical to prevent worker thread starvation
+        if offset < buf.len() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle a single client connection.
