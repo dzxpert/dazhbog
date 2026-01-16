@@ -49,11 +49,24 @@ impl Default for Limits {
 }
 
 /// TLS configuration.
+///
+/// Supports two modes:
+/// 1. PKCS#12 (native-tls): Set `pkcs12_path` - no ALPN/HTTP2 over TLS
+/// 2. PEM (rustls): Set `cert_pem_path` and `key_pem_path` - full ALPN/HTTP2 support
+///
+/// If both are configured, PEM/rustls is preferred for HTTP/2 ALPN support.
 #[derive(Clone, Debug)]
 pub struct TLS {
+    /// Path to PKCS#12 certificate bundle (native-tls, no ALPN)
     pub pkcs12_path: String,
+    /// Environment variable containing PKCS#12 password
     pub env_password_var: String,
+    /// Allow SSLv3 as minimum protocol (native-tls only)
     pub min_protocol_sslv3: bool,
+    /// Path to PEM-encoded certificate chain (rustls, enables ALPN/HTTP2)
+    pub cert_pem_path: Option<String>,
+    /// Path to PEM-encoded private key (rustls, enables ALPN/HTTP2)
+    pub key_pem_path: Option<String>,
 }
 
 impl Default for TLS {
@@ -62,6 +75,8 @@ impl Default for TLS {
             pkcs12_path: String::new(),
             env_password_var: "PKCSPASSWD".into(),
             min_protocol_sslv3: true,
+            cert_pem_path: None,
+            key_pem_path: None,
         }
     }
 }

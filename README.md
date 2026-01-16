@@ -47,8 +47,9 @@ export LUMINA_TLS=false
 *   **Append-Only Segments:** Immutable segment storage with CRC32C integrity validation and backward compatibility
 *   **Function History:** Complete revision history via `prev_addr` linked lists
 *   **Upstream Forwarding:** Multi-server upstream support with priority-based fallback for cache-miss scenarios
+*   **HTTP/1.1 + HTTP/2:** Full HTTP/2 support on all ports (h2c cleartext and h2 with ALPN over TLS)
 *   **HTTP Metrics:** Prometheus-compatible metrics endpoint at `/metrics`
-*   **TLS Support:** Optional TLS with configurable certificate validation
+*   **TLS Support:** Optional TLS with PKCS#12 (native-tls) or PEM (rustls with ALPN) certificates
 *   **Automatic Recovery:** Index rebuilds from segments on startup; automatic migration from legacy storage formats
 *   **Deduplication:** Optional startup deduplication to remove redundant records and reclaim space
 
@@ -57,8 +58,8 @@ export LUMINA_TLS=false
 `dazhbog` is built around four core components:
 
 1.  **Storage Engine** - Sled-backed append-only segments with persistent index and context tracking
-2.  **RPC Server** - Lumina protocol TCP server with TLS support and multi-protocol handshake detection
-3.  **HTTP Server** - Metrics and monitoring interface
+2.  **RPC Server** - Lumina protocol TCP server with TLS support and multi-protocol detection (HTTP/1.1, HTTP/2, binary RPC)
+3.  **HTTP Server** - HTTP/1.1 and HTTP/2 metrics and monitoring interface with automatic protocol detection
 4.  **Upstream Forwarding** - Optional proxy layer with priority-based multi-server support
 
 ### Storage Engine
@@ -290,8 +291,18 @@ upstream.0.license_path = "license.hexlic"
 upstream.0.timeout_ms = 8000
 upstream.0.batch_max = 131072
 
-# HTTP metrics server
+# HTTP metrics server (supports HTTP/1.1 and HTTP/2 h2c)
 http.bind_addr = "0.0.0.0:8080"
+
+# TLS Configuration (choose one or both)
+# Option 1: PKCS#12 (native-tls) - works with IDA certificates, no HTTP/2 ALPN
+tls.pkcs12_path = "./certs/server.p12"
+tls.env_password_var = "PKCSPASSWD"
+tls.min_protocol_sslv3 = true
+
+# Option 2: PEM (rustls) - full HTTP/2 ALPN support, recommended for browsers
+# tls.cert_pem_path = "./certs/server.crt"
+# tls.key_pem_path = "./certs/server.key"
 ```
 
 ### IDA Pro Configuration
@@ -368,6 +379,42 @@ LUMINA_TLS = NO;  // or YES if using TLS
 *   Backward-compatible CRC validation (supports legacy polynomial)
 *   Sled ensures atomic writes and durability
 *   No partial records possible due to sled's transaction model
+
+### HTTP/2 Support
+
+`dazhbog` supports HTTP/2 on all ports, enabling efficient multiplexed connections for metrics and monitoring:
+
+**Supported Modes:**
+
+| Mode | Port | How It Works |
+|------|------|--------------|
+| **h2c** (cleartext) | HTTP port, Lumina port | Detected via HTTP/2 connection preface (`PRI *`) |
+| **h2** (TLS + ALPN) | Lumina port | Negotiated during TLS handshake (requires rustls/PEM certs) |
+| **h2** (TLS, no ALPN) | Lumina port | Auto-detected after TLS handshake (native-tls/PKCS#12) |
+
+**TLS Configuration for HTTP/2:**
+
+```toml
+# Option 1: PKCS#12 (native-tls) - No ALPN, HTTP/2 via preface detection
+tls.pkcs12_path = "./certs/server.p12"
+tls.env_password_var = "PKCSPASSWD"
+
+# Option 2: PEM (rustls) - Full ALPN support for HTTP/2 (recommended for browsers)
+tls.cert_pem_path = "./certs/server.crt"
+tls.key_pem_path = "./certs/server.key"
+```
+
+If both PKCS#12 and PEM paths are configured, PEM/rustls is preferred for HTTP/2 ALPN support.
+
+**Testing HTTP/2:**
+
+```bash
+# Test HTTP/2 cleartext (h2c) on the HTTP port
+curl --http2 http://localhost:8080/metrics
+
+# Test HTTP/2 over TLS (h2) on the Lumina port
+curl --http2 -k https://localhost:1234/metrics
+```
 
 ### Monitoring
 

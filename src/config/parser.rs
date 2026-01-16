@@ -152,6 +152,18 @@ fn set_config_value(section: &str, key: &str, val: &str, cfg: &mut Config) -> Re
                 .get_or_insert_with(TLS::default)
                 .min_protocol_sslv3 = parse!(b);
         }
+        ("tls", "cert_pem_path") => {
+            let v = parse!(s);
+            cfg.lumina
+                .tls
+                .get_or_insert_with(TLS::default)
+                .cert_pem_path = if v.is_empty() { None } else { Some(v) };
+        }
+        ("tls", "key_pem_path") => {
+            let v = parse!(s);
+            cfg.lumina.tls.get_or_insert_with(TLS::default).key_pem_path =
+                if v.is_empty() { None } else { Some(v) };
+        }
 
         // Upstream section (indexed)
         ("upstream", key) if key.starts_with(|c: char| c.is_ascii_digit()) => {
