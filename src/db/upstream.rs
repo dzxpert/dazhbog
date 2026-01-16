@@ -266,9 +266,7 @@ pub async fn fetch_from_upstreams(
             missing_keys.len()
         );
 
-        METRICS
-            .upstream_requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METRICS.inc_upstream_requests();
 
         // Fetch from this upstream
         match fetch_from_single_upstream(up, &missing_keys).await {
@@ -285,14 +283,10 @@ pub async fn fetch_from_upstreams(
                     "upstream: server {} returned {} functions",
                     server_idx, found_count
                 );
-                METRICS
-                    .upstream_fetched
-                    .fetch_add(found_count, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_upstream_fetched(found_count);
             }
             Err(e) => {
-                METRICS
-                    .upstream_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_upstream_errors();
                 warn!(
                     "upstream: server {} ({}:{}) failed: {}",
                     server_idx, up.host, up.port, e
@@ -330,9 +324,7 @@ async fn fetch_from_single_upstream(up: &Upstream, keys: &[u128]) -> io::Result<
         let mut conn = match connect(up).await {
             Ok(c) => c,
             Err(e) => {
-                METRICS
-                    .upstream_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_upstream_errors();
                 warn!("upstream connect failed: {}", e);
                 // keep None for these entries; try next batch
                 start = end;
@@ -340,9 +332,7 @@ async fn fetch_from_single_upstream(up: &Upstream, keys: &[u128]) -> io::Result<
             }
         };
         if let Err(e) = upstream_handshake(&mut conn, up).await {
-            METRICS
-                .upstream_errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            METRICS.inc_upstream_errors();
             warn!("upstream handshake failed: {}", e);
             start = end;
             continue;
@@ -360,17 +350,13 @@ async fn fetch_from_single_upstream(up: &Upstream, keys: &[u128]) -> io::Result<
         )
         .await;
         if let Err(e) = write_result {
-            METRICS
-                .upstream_errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            METRICS.inc_upstream_errors();
             warn!("upstream write pull timeout: {}", e);
             start = end;
             continue;
         }
         if let Err(e) = write_result.unwrap() {
-            METRICS
-                .upstream_errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            METRICS.inc_upstream_errors();
             warn!("upstream write pull failed: {}", e);
             start = end;
             continue;
@@ -393,26 +379,20 @@ async fn fetch_from_single_upstream(up: &Upstream, keys: &[u128]) -> io::Result<
                 v
             }
             Ok(Err(e)) => {
-                METRICS
-                    .upstream_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_upstream_errors();
                 warn!("upstream read pull failed: {} (io kind: {:?})", e, e.kind());
                 start = end;
                 continue;
             }
             Err(_) => {
-                METRICS
-                    .upstream_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_upstream_errors();
                 warn!("upstream read pull timeout");
                 start = end;
                 continue;
             }
         };
         if typ != 0x0f {
-            METRICS
-                .upstream_errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            METRICS.inc_upstream_errors();
             warn!("upstream unexpected msg type: 0x{:02x}", typ);
             start = end;
             continue;
@@ -438,14 +418,10 @@ async fn fetch_from_single_upstream(up: &Upstream, keys: &[u128]) -> io::Result<
                     }
                 }
                 debug!("upstream: mapped {} functions to results", found_count);
-                METRICS
-                    .upstream_fetched
-                    .fetch_add(found_count as u64, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_upstream_fetched(found_count as u64);
             }
             Err(e) => {
-                METRICS
-                    .upstream_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_upstream_errors();
                 warn!("upstream decode pull result failed: {:?}", e);
             }
         }

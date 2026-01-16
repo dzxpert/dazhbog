@@ -20,6 +20,7 @@ pub struct EngineRuntime {
     pub index: Arc<ShardedIndex>,
     pub ctx_index: Arc<ContextIndex>,
     pub search: Arc<SearchIndex>,
+    pub index_db: sled::Db,
     #[allow(dead_code)]
     pub cfg: Engine,
     #[allow(dead_code)]
@@ -73,8 +74,29 @@ impl EngineRuntime {
             index,
             ctx_index,
             search,
+            index_db,
             cfg,
             scoring,
         })
     }
+
+    /// Get current database statistics for metrics initialization.
+    pub fn get_stats(&self) -> EngineStats {
+        EngineStats {
+            indexed_funcs: self.index.entry_count(),
+            total_records: self.segments.get_record_count(),
+            storage_bytes: self.segments.get_storage_bytes(),
+            search_docs: self.search.doc_count(),
+            unique_binaries: self.ctx_index.unique_binaries_count(),
+        }
+    }
+}
+
+/// Statistics snapshot for metrics initialization.
+pub struct EngineStats {
+    pub indexed_funcs: u64,
+    pub total_records: u64,
+    pub storage_bytes: u64,
+    pub search_docs: u64,
+    pub unique_binaries: u64,
 }

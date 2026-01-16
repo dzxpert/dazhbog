@@ -124,7 +124,12 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
             };
 
             if let Err(e) = res {
-                debug!("connection {} ended: {}", addr, e);
+                let msg = e.to_string();
+                if msg.contains("TLS handshake detected") {
+                    warn!("connection {} ended: {}", addr, msg);
+                } else {
+                    debug!("connection {} ended: {}", addr, msg);
+                }
             } else {
                 debug!("connection {} closed cleanly", addr);
             }

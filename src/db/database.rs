@@ -8,6 +8,7 @@ use crate::engine::{SearchDocument, SearchHit};
 use super::failure_cache::FailureCache;
 use super::types::{FuncLatest, PushContext, QueryContext};
 
+use log::*;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
@@ -24,6 +25,20 @@ impl Database {
     /// Open or create a database with the given configuration.
     pub async fn open(cfg: Arc<Config>) -> io::Result<Arc<Self>> {
         let rt = EngineRuntime::open(cfg.engine.clone(), cfg.scoring.clone())?;
+
+        // Initialize metrics with current database stats
+        let stats = rt.get_stats();
+        if let Err(e) = METRICS.init(
+            &rt.index_db,
+            stats.indexed_funcs,
+            stats.total_records,
+            stats.storage_bytes,
+            stats.search_docs,
+            stats.unique_binaries,
+        ) {
+            warn!("Failed to initialize persistent metrics: {}", e);
+        }
+
         Ok(Arc::new(Self {
             rt: Arc::new(rt),
             failure_cache: FailureCache::new(),
@@ -166,18 +181,21 @@ impl Database {
             };
             let addr = self.rt.segments.append(&rec)?;
             match self.rt.index.upsert(*key, addr) {
-                Ok(UpsertResult::Inserted) => status.push(1),
-                Ok(UpsertResult::Replaced(_)) => status.push(0),
+                Ok(UpsertResult::Inserted) => {
+                    status.push(1);
+                    METRICS.inc_indexed_funcs();
+                    METRICS.inc_total_records();
+                }
+                Ok(UpsertResult::Replaced(_)) => {
+                    status.push(0);
+                    METRICS.inc_total_records();
+                }
                 Err(IndexError::Full) => {
-                    METRICS
-                        .append_failures
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    METRICS.inc_append_failures();
                     return Err(io::Error::new(io::ErrorKind::Other, "index full"));
                 }
                 Err(IndexError::Io(e)) => {
-                    METRICS
-                        .append_failures
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    METRICS.inc_append_failures();
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!("index io error: {}", e),
@@ -269,16 +287,13 @@ impl Database {
         &self,
         ctx: &QueryContext<'_>,
     ) -> io::Result<Vec<Option<(u32, u32, String, Vec<u8>)>>> {
+        use std::sync::atomic::Ordering::Relaxed;
         use std::time::Instant;
-        METRICS
-            .scoring_batches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METRICS.inc_scoring_batches();
         let start = Instant::now();
 
         if self.rt.ctx_index.approx_is_empty() {
-            METRICS
-                .scoring_fallback_latest
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            METRICS.inc_scoring_fallback();
             let mut out = Vec::with_capacity(ctx.keys.len());
             for &k in ctx.keys {
                 out.push(
@@ -287,10 +302,9 @@ impl Database {
                         .map(|f| (f.popularity, f.len_bytes, f.name, f.data)),
                 );
             }
-            METRICS.scoring_time_ns.fetch_add(
-                start.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            METRICS
+                .scoring_time_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
             return Ok(out);
         }
 
@@ -534,14 +548,10 @@ impl Database {
             )));
         }
 
-        METRICS.scoring_versions_considered.fetch_add(
-            versions_considered_total,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        METRICS.scoring_time_ns.fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        METRICS.inc_scoring_versions(versions_considered_total);
+        METRICS
+            .scoring_time_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
         Ok(results)
     }
 }

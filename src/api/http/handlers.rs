@@ -22,40 +22,84 @@ pub struct SearchResponse {
 /// Metrics snapshot for JSON API.
 #[derive(Serialize)]
 pub struct MetricsSnapshot {
+    // Database stats
+    indexed_funcs: u64,
+    total_records: u64,
+    storage_bytes: u64,
+    search_docs: u64,
+    unique_binaries: u64,
+    uptime_secs: u64,
+    start_time: u64,
+
+    // Traffic counters
     pulls: u64,
     pushes: u64,
     new_funcs: u64,
     queried_funcs: u64,
     active_connections: u64,
+
+    // Protocol counters
+    lumina_v0_4: u64,
+    lumina_v5p: u64,
+
+    // Error counters
     errors: u64,
     timeouts: u64,
     index_overflows: u64,
     append_failures: u64,
     decoder_rejects: u64,
+
+    // Upstream counters
     upstream_requests: u64,
+    upstream_fetched: u64,
     upstream_errors: u64,
+
+    // Scoring counters
     scoring_batches: u64,
     scoring_versions_considered: u64,
+    scoring_fallback_latest: u64,
 }
 
 /// Get current metrics snapshot.
 pub fn metrics_snapshot() -> MetricsSnapshot {
     use std::sync::atomic::Ordering::Relaxed;
     MetricsSnapshot {
+        // Database stats
+        indexed_funcs: METRICS.indexed_funcs.load(Relaxed),
+        total_records: METRICS.total_records.load(Relaxed),
+        storage_bytes: METRICS.storage_bytes.load(Relaxed),
+        search_docs: METRICS.search_docs.load(Relaxed),
+        unique_binaries: METRICS.unique_binaries.load(Relaxed),
+        uptime_secs: METRICS.uptime_secs(),
+        start_time: METRICS.start_time.load(Relaxed),
+
+        // Traffic counters
         pulls: METRICS.pulls.load(Relaxed),
         pushes: METRICS.pushes.load(Relaxed),
         new_funcs: METRICS.new_funcs.load(Relaxed),
         queried_funcs: METRICS.queried_funcs.load(Relaxed),
         active_connections: METRICS.active_connections.load(Relaxed),
+
+        // Protocol counters
+        lumina_v0_4: METRICS.lumina_v0_4.load(Relaxed),
+        lumina_v5p: METRICS.lumina_v5p.load(Relaxed),
+
+        // Error counters
         errors: METRICS.errors.load(Relaxed),
         timeouts: METRICS.timeouts.load(Relaxed),
         index_overflows: METRICS.index_overflows.load(Relaxed),
         append_failures: METRICS.append_failures.load(Relaxed),
         decoder_rejects: METRICS.decoder_rejects.load(Relaxed),
+
+        // Upstream counters
         upstream_requests: METRICS.upstream_requests.load(Relaxed),
+        upstream_fetched: METRICS.upstream_fetched.load(Relaxed),
         upstream_errors: METRICS.upstream_errors.load(Relaxed),
+
+        // Scoring counters
         scoring_batches: METRICS.scoring_batches.load(Relaxed),
         scoring_versions_considered: METRICS.scoring_versions_considered.load(Relaxed),
+        scoring_fallback_latest: METRICS.scoring_fallback_latest.load(Relaxed),
     }
 }
 

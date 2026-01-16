@@ -193,6 +193,11 @@ impl SearchIndex {
 
         Ok(hits)
     }
+
+    /// Get the number of documents in the search index.
+    pub fn doc_count(&self) -> u64 {
+        self.reader.searcher().num_docs()
+    }
 }
 
 fn build_schema() -> Schema {

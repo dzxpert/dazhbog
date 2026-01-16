@@ -8,6 +8,17 @@ use tokio::io::AsyncReadExt;
 
 use super::budget::{Budget, OwnedFrame};
 
+/// Check if the first bytes look like a TLS ClientHello.
+///
+/// TLS record format:
+/// - Byte 0: ContentType (0x16 = Handshake)
+/// - Byte 1: Major version (0x03)
+/// - Byte 2: Minor version (0x00=SSLv3, 0x01=TLS1.0, 0x02=TLS1.1, 0x03=TLS1.2/1.3)
+/// - Bytes 3-4: Record length
+fn looks_like_tls_handshake(head: &[u8; 4]) -> bool {
+    head[0] == 0x16 && head[1] == 0x03 && head[2] <= 0x04
+}
+
 /// Read a frame with budget-limited memory allocation.
 ///
 /// Supports both legacy Lumina protocol and new RPC protocol:
@@ -34,6 +45,13 @@ pub async fn read_multiproto_bounded<R: tokio::io::AsyncRead + Unpin>(
     let len_field = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
 
     if len_field > max_len_field {
+        // Check if this looks like a TLS handshake attempt
+        if looks_like_tls_handshake(&[head[0], head[1], head[2], head[3]]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS handshake detected but server has TLS disabled - client should set LUMINA_TLS=false",
+            ));
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame too large",

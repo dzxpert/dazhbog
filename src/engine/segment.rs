@@ -866,4 +866,27 @@ impl OpenSegments {
 
         Ok((total_records, written_records, bytes_saved))
     }
+
+    /// Get total storage bytes used by all segments.
+    pub fn get_storage_bytes(&self) -> u64 {
+        let rs = self.readers.lock();
+        self.total_segment_size(&rs)
+    }
+
+    /// Get total record count across all segments.
+    pub fn get_record_count(&self) -> u64 {
+        let rs = self.readers.lock();
+        rs.iter().map(|r| r.tree.len() as u64).sum()
+    }
+
+    /// Get number of segments.
+    pub fn get_segment_count(&self) -> u16 {
+        let rs = self.readers.lock();
+        rs.len() as u16
+    }
+
+    /// Get reference to the sled database.
+    pub fn sled_db(&self) -> &sled::Db {
+        &self.db
+    }
 }

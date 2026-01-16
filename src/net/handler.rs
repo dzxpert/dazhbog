@@ -417,9 +417,7 @@ async fn handle_lumina_pull<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
         .map(|o| if o.is_some() { 0 } else { 1 })
         .collect();
 
-    METRICS
-        .queried_funcs
-        .fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    METRICS.inc_queried_funcs(keys.len() as u64);
 
     // Upstream fetch for remaining misses
     if !cfg.upstreams.is_empty() {
@@ -458,13 +456,8 @@ async fn handle_lumina_pull<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                             Ok(st) => {
                                 let new_funcs = st.iter().filter(|&&v| v == 1).count() as u64;
                                 let updated_funcs = st.iter().filter(|&&v| v == 0).count() as u64;
-                                METRICS.pushes.fetch_add(
-                                    (new_funcs + updated_funcs) as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                METRICS
-                                    .new_funcs
-                                    .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+                                METRICS.inc_pushes(new_funcs + updated_funcs);
+                                METRICS.inc_new_funcs(new_funcs);
                             }
                             Err(e) => {
                                 error!("db push after upstream: {}", e);
@@ -486,10 +479,7 @@ async fn handle_lumina_pull<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
         }
     }
 
-    METRICS.pulls.fetch_add(
-        found_list.len() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    METRICS.inc_pulls(found_list.len() as u64);
     debug!(
         "Lumina PULL response: {} found, {} not found",
         found_list.len(),
@@ -582,13 +572,8 @@ async fn handle_lumina_push<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
             let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
             let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
 
-            METRICS.pushes.fetch_add(
-                (new_funcs + updated_funcs) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            METRICS
-                .new_funcs
-                .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+            METRICS.inc_pushes(new_funcs + updated_funcs);
+            METRICS.inc_new_funcs(new_funcs);
 
             debug!(
                 "Lumina PUSH response: {} new, {} updated, {} unchanged",
@@ -782,9 +767,7 @@ async fn handle_rpc_pull<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
     };
 
     debug!("PULL request: {} keys", keys.len());
-    METRICS
-        .queried_funcs
-        .fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    METRICS.inc_queried_funcs(keys.len() as u64);
 
     let qctx = crate::db::QueryContext {
         keys: &keys,
@@ -858,13 +841,8 @@ async fn handle_rpc_pull<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
                             Ok(st) => {
                                 let new_funcs = st.iter().filter(|&&v| v == 1).count() as u64;
                                 let updated_funcs = st.iter().filter(|&&v| v == 0).count() as u64;
-                                METRICS.pushes.fetch_add(
-                                    (new_funcs + updated_funcs) as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                METRICS
-                                    .new_funcs
-                                    .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+                                METRICS.inc_pushes(new_funcs + updated_funcs);
+                                METRICS.inc_new_funcs(new_funcs);
                             }
                             Err(e) => {
                                 error!("db push after upstream: {}", e);
@@ -886,9 +864,7 @@ async fn handle_rpc_pull<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
         }
     }
 
-    METRICS
-        .pulls
-        .fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    METRICS.inc_pulls(found.len() as u64);
     debug!(
         "PULL response: {} found, {} not found (took {:?})",
         found.len(),
@@ -947,13 +923,8 @@ async fn handle_rpc_push<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
             let new_funcs = status.iter().filter(|&&v| v == 1).count() as u64;
             let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
             let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
-            METRICS.pushes.fetch_add(
-                (new_funcs + updated_funcs) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            METRICS
-                .new_funcs
-                .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+            METRICS.inc_pushes(new_funcs + updated_funcs);
+            METRICS.inc_new_funcs(new_funcs);
 
             // Remove successfully pushed keys from failure cache
             for it in &items {

@@ -371,6 +371,11 @@ impl ContextIndex {
 
         Ok(())
     }
+
+    /// Get the count of unique binaries (md5s) observed.
+    pub fn unique_binaries_count(&self) -> u64 {
+        self.t_binary_meta.len() as u64
+    }
 }
 
 // ----------------- encoding helpers -----------------

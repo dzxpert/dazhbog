@@ -38,9 +38,7 @@ pub fn decode_pull(payload: &[u8], max_items: usize) -> Result<Vec<u128>, CodecE
     let n = u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize;
 
     if n > max_items {
-        METRICS
-            .decoder_rejects
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METRICS.inc_decoder_rejects();
         return Err(CodecError::Malformed("pull count exceeds cap"));
     }
 
@@ -69,9 +67,7 @@ pub fn decode_push(payload: &[u8], caps: &PushCaps) -> Result<Vec<PushItem>, Cod
     let n = u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize;
 
     if n > caps.max_items {
-        METRICS
-            .decoder_rejects
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METRICS.inc_decoder_rejects();
         return Err(CodecError::Malformed("push count exceeds cap"));
     }
 
@@ -90,9 +86,7 @@ pub fn decode_push(payload: &[u8], caps: &PushCaps) -> Result<Vec<PushItem>, Cod
         let name = match get_str_max(&mut p, caps.max_name_bytes) {
             Ok(s) => s,
             Err(CodecError::Malformed("string too large")) => {
-                METRICS
-                    .decoder_rejects
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_decoder_rejects();
                 return Err(CodecError::Malformed("string too large"));
             }
             Err(e) => return Err(e),
@@ -100,9 +94,7 @@ pub fn decode_push(payload: &[u8], caps: &PushCaps) -> Result<Vec<PushItem>, Cod
         let data = match get_bytes_max(&mut p, caps.max_data_bytes) {
             Ok(b) => b,
             Err(CodecError::Malformed("bytes too large")) => {
-                METRICS
-                    .decoder_rejects
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                METRICS.inc_decoder_rejects();
                 return Err(CodecError::Malformed("bytes too large"));
             }
             Err(e) => return Err(e),
@@ -136,9 +128,7 @@ pub fn decode_hist(payload: &[u8], max_items: usize) -> Result<(u32, Vec<u128>),
     let n = u32::from_le_bytes(p[4..8].try_into().unwrap()) as usize;
 
     if n > max_items {
-        METRICS
-            .decoder_rejects
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METRICS.inc_decoder_rejects();
         return Err(CodecError::Malformed("hist count exceeds cap"));
     }
 
