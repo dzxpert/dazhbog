@@ -318,18 +318,27 @@ impl ContextIndex {
     }
 
     pub fn resolve_basenames_for_key(&self, key: u128) -> io::Result<Vec<String>> {
-        let mut names = self.get_basenames_for_key(key)?;
-        let mut seen: std::collections::HashSet<String> = names.iter().cloned().collect();
+        // Sanitize all basenames to ensure only filenames are returned (no paths)
+        // This protects against leaking usernames or directory structure from old data
+        let mut names: Vec<String> = self
+            .get_basenames_for_key(key)?
+            .into_iter()
+            .map(|b| sanitize_basename(&b))
+            .filter(|b| !b.is_empty())
+            .collect();
+        let mut seen: std::collections::HashSet<String> =
+            names.iter().map(|s| s.to_lowercase()).collect();
 
         if names.len() < MAX_BASENAMES_PER_KEY {
             let md5_list = self.get_md5_bins_for_key(key)?;
             for entry in md5_list.iter() {
                 if let Ok(Some(meta)) = self.get_binary_meta(&entry.md5) {
-                    if !meta.basename.is_empty()
-                        && seen.insert(meta.basename.clone())
+                    let clean = sanitize_basename(&meta.basename);
+                    if !clean.is_empty()
+                        && seen.insert(clean.to_lowercase())
                         && names.len() < MAX_BASENAMES_PER_KEY
                     {
-                        names.push(meta.basename);
+                        names.push(clean);
                     }
                 }
             }

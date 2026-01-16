@@ -1,12 +1,15 @@
-# Build stage
-FROM rust:1.91-slim as builder
+# Build stage - use bookworm-based rust image to match runtime glibc
+FROM rust:1.91-slim-bookworm as builder
 
 WORKDIR /app
 
 # Install build dependencies
 RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev && \
+    apt-get install -y pkg-config libssl-dev cmake clang && \
     rm -rf /var/lib/apt/lists/*
+
+# Copy vendor directory first (for patched crates)
+COPY vendor ./vendor
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
@@ -17,7 +20,7 @@ COPY src ./src
 # Build for release
 RUN cargo build --release
 
-# Runtime stage
+# Runtime stage - must match builder's glibc version
 FROM debian:bookworm-slim
 
 WORKDIR /app
@@ -30,12 +33,11 @@ RUN apt-get update && \
 # Copy the binary from builder
 COPY --from=builder /app/target/release/dazhbog /app/dazhbog
 
-# Copy config and data if needed
+# Copy config if needed (data should be mounted as volume)
 COPY config.toml ./
-COPY data ./data
 
-# Expose port
-EXPOSE 1234
+# Expose ports (Lumina RPC + HTTP metrics)
+EXPOSE 1234 8080
 
 # Run the binary
-CMD ["./dazhbog"]
+CMD ["./dazhbog", "config.toml"]
