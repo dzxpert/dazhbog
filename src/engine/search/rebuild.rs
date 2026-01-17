@@ -37,7 +37,8 @@ pub fn rebuild_from_engine(
 
     let mut docs = Vec::with_capacity(latest.len());
     for (key, (ts, name)) in latest.into_iter() {
-        let basenames = ctx_index.resolve_basenames_for_key(key)?;
+        // Get basenames if available, but don't fail if context index is empty
+        let basenames = ctx_index.resolve_basenames_for_key(key).unwrap_or_default();
         docs.push(SearchDocument {
             key,
             func_name: name,

@@ -1,7 +1,13 @@
 use std::collections::HashMap;
+use std::env;
 use std::{io, path::PathBuf};
 
 const MAGIC: u32 = 0x4C4D4E31;
+
+/// Pack segment ID, offset, and flags into a single 64-bit address.
+const fn pack_addr(seg_id: u16, offset: u64, flags: u8) -> u64 {
+    ((seg_id as u64) << 48) | ((offset & ((1u64 << 40) - 1)) << 8) | (flags as u64)
+}
 
 mod crc32c_impl {
     use std::sync::Once;
@@ -218,14 +224,415 @@ fn write_record_to_tree(tree: &sled::Tree, offset: u64, rec: &Record) -> io::Res
     Ok(total_len)
 }
 
+fn print_usage() {
+    eprintln!("Usage: recover [COMMAND] [OPTIONS]");
+    eprintln!();
+    eprintln!("Commands:");
+    eprintln!("  --rebuild-index [DATA_DIR]   Rebuild the key->addr index from segment data");
+    eprintln!("  --rebuild-search [DATA_DIR]  Rebuild the full-text search index");
+    eprintln!("  --full-recover [DATA_DIR]    Full recovery with deduplication");
+    eprintln!("  --help                       Show this help message");
+    eprintln!();
+    eprintln!("Default DATA_DIR is 'data/'");
+}
+
+fn rebuild_index(data_dir: &PathBuf) -> io::Result<()> {
+    let seg_db_dir = data_dir.join("segments_db");
+    let index_db_dir = data_dir.join("index_db");
+
+    if !seg_db_dir.exists() {
+        eprintln!(
+            "Error: {}/segments_db directory not found.",
+            data_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!("=== Dazhbog Index Rebuild Tool ===\n");
+    println!("Data directory: {}", data_dir.display());
+
+    // Open the segments database (read-only scan)
+    let seg_db = sled::open(&seg_db_dir)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open segments: {}", e)))?;
+
+    // Open/create the index database
+    let index_db = sled::Config::default()
+        .path(&index_db_dir)
+        .cache_capacity(128 * 1024 * 1024)
+        .open()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open index: {}", e)))?;
+
+    let index_tree = index_db.open_tree("latest").map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("sled open latest tree: {}", e),
+        )
+    })?;
+
+    // Clear the existing index
+    println!("Clearing existing index...");
+    index_tree
+        .clear()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clear index: {}", e)))?;
+
+    // Get segment tree names
+    let mut tree_names: Vec<_> = seg_db
+        .tree_names()
+        .into_iter()
+        .map(|name| String::from_utf8_lossy(&name).to_string())
+        .filter(|name| name.starts_with("seg."))
+        .collect();
+    tree_names.sort();
+
+    println!("Found {} segment trees", tree_names.len());
+
+    // Track latest record for each key (by timestamp)
+    let mut latest_by_key: HashMap<u128, (u64, u64, u8)> = HashMap::new(); // key -> (ts, addr, flags)
+    let mut total_records = 0u64;
+    let mut corrupt_records = 0u64;
+
+    for name in &tree_names {
+        let seg_id: u16 = name[4..9].parse().unwrap_or(0);
+        let tree = seg_db.open_tree(name).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("open tree {}: {}", name, e))
+        })?;
+
+        println!("Scanning {} ({} records)...", name, tree.len());
+
+        for item in tree.iter() {
+            let (offset_bytes, record_bytes) = match item {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            let offset = u64::from_be_bytes(offset_bytes.as_ref().try_into().unwrap());
+
+            if record_bytes.len() < 12 {
+                corrupt_records += 1;
+                continue;
+            }
+
+            let hdr: &[u8] = &record_bytes[0..12];
+            let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            if magic != MAGIC {
+                corrupt_records += 1;
+                continue;
+            }
+
+            let stored_crc = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+            let body = &record_bytes[12..];
+
+            // Verify CRC
+            let computed_crc = crc32c_impl::crc32c(0, body);
+            let crc_valid = if computed_crc == stored_crc {
+                true
+            } else {
+                let computed_crc_legacy = crc32c_impl::crc32c_legacy(0, body);
+                computed_crc_legacy == stored_crc
+            };
+
+            if !crc_valid {
+                corrupt_records += 1;
+                continue;
+            }
+
+            if body.len() < 52 {
+                corrupt_records += 1;
+                continue;
+            }
+
+            // Parse key, timestamp, and flags
+            let lo = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(body[8..16].try_into().unwrap());
+            let key = ((hi as u128) << 64) | (lo as u128);
+            let ts_sec = u64::from_le_bytes(body[16..24].try_into().unwrap());
+            let flags = body[46];
+
+            let addr = pack_addr(seg_id, offset, flags);
+
+            // Keep the latest version
+            match latest_by_key.get(&key) {
+                Some(&(existing_ts, _, _)) if existing_ts >= ts_sec => {}
+                _ => {
+                    latest_by_key.insert(key, (ts_sec, addr, flags));
+                }
+            }
+
+            total_records += 1;
+        }
+    }
+
+    println!("\n=== Scan Results ===");
+    println!("Total valid records: {}", total_records);
+    println!("Corrupt records skipped: {}", corrupt_records);
+    println!("Unique keys: {}", latest_by_key.len());
+
+    // Write index entries (skip deleted records)
+    println!("\nWriting index entries...");
+    let mut indexed = 0u64;
+    let mut deleted = 0u64;
+
+    for (key, (_ts, addr, flags)) in &latest_by_key {
+        if flags & 0x01 == 0x01 {
+            // Deleted record, don't index
+            deleted += 1;
+            continue;
+        }
+
+        index_tree
+            .insert(key.to_le_bytes(), addr.to_le_bytes().as_slice())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("index insert: {}", e)))?;
+        indexed += 1;
+
+        if indexed % 10000 == 0 {
+            print!("\r  Indexed {} entries...", indexed);
+        }
+    }
+
+    index_db.flush()?;
+
+    println!("\n\n=== Index Rebuild Complete ===");
+    println!("✓ Indexed {} keys", indexed);
+    println!("✓ Skipped {} deleted keys", deleted);
+    println!("\nYou can now restart the dazhbog server.");
+
+    Ok(())
+}
+
+fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
+    let seg_db_dir = data_dir.join("segments_db");
+    let search_dir = data_dir.join("search_index");
+
+    if !seg_db_dir.exists() {
+        eprintln!(
+            "Error: {}/segments_db directory not found.",
+            data_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!("=== Dazhbog Search Index Rebuild Tool ===\n");
+    println!("Data directory: {}", data_dir.display());
+
+    // Open the segments database
+    let seg_db = sled::open(&seg_db_dir)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open segments: {}", e)))?;
+
+    // Get segment tree names
+    let mut tree_names: Vec<_> = seg_db
+        .tree_names()
+        .into_iter()
+        .map(|name| String::from_utf8_lossy(&name).to_string())
+        .filter(|name| name.starts_with("seg."))
+        .collect();
+    tree_names.sort();
+
+    println!("Found {} segment trees", tree_names.len());
+
+    // Collect latest record for each key
+    let mut latest_by_key: HashMap<u128, (u64, String)> = HashMap::new(); // key -> (ts, name)
+    let mut total_records = 0u64;
+
+    for name in &tree_names {
+        let tree = seg_db.open_tree(name).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("open tree {}: {}", name, e))
+        })?;
+
+        println!("Scanning {} ({} records)...", name, tree.len());
+
+        for item in tree.iter() {
+            let (offset_bytes, record_bytes) = match item {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            if record_bytes.len() < 12 {
+                continue;
+            }
+
+            let hdr: &[u8] = &record_bytes[0..12];
+            let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            if magic != MAGIC {
+                continue;
+            }
+
+            let stored_crc = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+            let body = &record_bytes[12..];
+
+            // Verify CRC
+            let computed_crc = crc32c_impl::crc32c(0, body);
+            let crc_valid = if computed_crc == stored_crc {
+                true
+            } else {
+                let computed_crc_legacy = crc32c_impl::crc32c_legacy(0, body);
+                computed_crc_legacy == stored_crc
+            };
+
+            if !crc_valid || body.len() < 52 {
+                continue;
+            }
+
+            // Parse key, timestamp, flags, and name
+            let lo = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(body[8..16].try_into().unwrap());
+            let key = ((hi as u128) << 64) | (lo as u128);
+            let ts_sec = u64::from_le_bytes(body[16..24].try_into().unwrap());
+            let flags = body[46];
+
+            // Skip deleted records
+            if flags & 0x01 == 0x01 {
+                continue;
+            }
+
+            let name_len = u16::from_le_bytes(body[40..42].try_into().unwrap()) as usize;
+            let name_start = 52;
+            if name_start + name_len > body.len() {
+                continue;
+            }
+            let name = match std::str::from_utf8(&body[name_start..name_start + name_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+
+            // Keep the latest version
+            match latest_by_key.get(&key) {
+                Some(&(existing_ts, _)) if existing_ts >= ts_sec => {}
+                _ => {
+                    latest_by_key.insert(key, (ts_sec, name));
+                }
+            }
+
+            total_records += 1;
+        }
+    }
+
+    println!("\n=== Scan Results ===");
+    println!("Total valid records: {}", total_records);
+    println!("Unique keys to index: {}", latest_by_key.len());
+
+    // Delete and recreate search index
+    if search_dir.exists() {
+        println!("\nRemoving old search index...");
+        std::fs::remove_dir_all(&search_dir)?;
+    }
+    std::fs::create_dir_all(&search_dir)?;
+
+    // Use tantivy directly for indexing
+    use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED};
+    use tantivy::tokenizer::{LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer};
+    use tantivy::{Index, IndexWriter};
+
+    // Build schema (must match SearchIndex::build_schema)
+    let mut builder = Schema::builder();
+    let ngram_indexing = TextFieldIndexing::default()
+        .set_tokenizer("edge_ngram")
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+    let text_options = TextOptions::default()
+        .set_indexing_options(ngram_indexing.clone())
+        .set_stored();
+    let key_options = TextOptions::default().set_stored().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("raw")
+            .set_index_option(IndexRecordOption::Basic),
+    );
+
+    let key_hex = builder.add_text_field("key_hex", key_options);
+    let func_name = builder.add_text_field("func_name", text_options.clone());
+    let _binary_name = builder.add_text_field("binary_name", text_options);
+    let ts = builder.add_u64_field("ts", STORED);
+    let schema = builder.build();
+
+    // Create index
+    let index = Index::create_in_dir(&search_dir, schema)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("create index: {}", e)))?;
+
+    // Register tokenizers
+    let edge_ngram =
+        TextAnalyzer::builder(NgramTokenizer::new(2, 12, true).expect("ngram tokenizer"))
+            .filter(LowerCaser)
+            .build();
+    let raw = TextAnalyzer::builder(RawTokenizer::default()).build();
+    index.tokenizers().register("edge_ngram", edge_ngram);
+    index.tokenizers().register("raw", raw);
+
+    // Create writer
+    let mut writer: IndexWriter = index
+        .writer(50_000_000)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("writer: {}", e)))?;
+
+    println!("\nIndexing {} functions...", latest_by_key.len());
+    let mut indexed = 0u64;
+
+    for (k, (ts_val, name)) in latest_by_key.iter() {
+        let key_hex_str = format!("{:032x}", k);
+        let mut doc = tantivy::Document::new();
+        doc.add_text(key_hex, &key_hex_str);
+        doc.add_text(func_name, name);
+        doc.add_u64(ts, *ts_val);
+        // Note: binary_name not populated (would need context index)
+
+        writer
+            .add_document(doc)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("add doc: {}", e)))?;
+
+        indexed += 1;
+        if indexed % 10000 == 0 {
+            print!("\r  Indexed {} functions...", indexed);
+        }
+    }
+
+    println!("\r  Indexed {} functions", indexed);
+    println!("\nCommitting...");
+    writer
+        .commit()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("commit: {}", e)))?;
+
+    println!("\n=== Search Index Rebuild Complete ===");
+    println!("✓ Indexed {} functions", indexed);
+    println!("\nYou can now restart the dazhbog server.");
+
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
-    let data_dir = PathBuf::from("data");
+    let args: Vec<String> = env::args().collect();
+
+    // Parse arguments
+    let command = args.get(1).map(|s| s.as_str());
+    let data_path = args
+        .get(2)
+        .map(|s| PathBuf::from(s))
+        .unwrap_or_else(|| PathBuf::from("data"));
+
+    match command {
+        Some("--help") | Some("-h") => {
+            print_usage();
+            return Ok(());
+        }
+        Some("--rebuild-index") => {
+            return rebuild_index(&data_path);
+        }
+        Some("--rebuild-search") => {
+            return rebuild_search(&data_path);
+        }
+        Some("--full-recover") | None => {
+            // Continue with full recovery below
+        }
+        Some(other) => {
+            eprintln!("Unknown command: {}", other);
+            print_usage();
+            std::process::exit(1);
+        }
+    }
+
+    // Full recovery mode
+    let data_dir = data_path;
     let seg_db_dir = data_dir.join("segments_db");
     let backup_dir = PathBuf::from("data.backup");
     let temp_dir = PathBuf::from("data.recovered");
 
     if !seg_db_dir.exists() {
-        eprintln!("Error: data/segments_db directory not found. This tool requires the new sled-based storage.");
+        eprintln!("Error: {}/segments_db directory not found. This tool requires the new sled-based storage.", data_dir.display());
         eprintln!(
             "If you have old seg.*.dat files, run the main dazhbog server once to migrate them."
         );

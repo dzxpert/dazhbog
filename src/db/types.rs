@@ -17,6 +17,14 @@ pub struct PushContext<'a> {
     pub hostname: Option<&'a str>,
 }
 
+/// Owned version of PushContext for use in spawn_blocking.
+#[derive(Clone, Debug)]
+pub struct OwnedPushContext {
+    pub md5: Option<[u8; 16]>,
+    pub basename: Option<String>,
+    pub hostname: Option<String>,
+}
+
 /// Context information for query operations.
 #[derive(Clone)]
 pub struct QueryContext<'a> {

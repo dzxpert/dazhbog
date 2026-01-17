@@ -1,12 +1,13 @@
 //! Main database implementation for function metadata storage.
 
 use crate::api::metrics::METRICS;
+use crate::common::{addr_off, addr_seg};
 use crate::config::Config;
 use crate::engine::{EngineRuntime, IndexError, Record, UpsertResult};
 use crate::engine::{SearchDocument, SearchHit};
 
 use super::failure_cache::FailureCache;
-use super::types::{FuncLatest, PushContext, QueryContext};
+use super::types::{FuncLatest, OwnedPushContext, PushContext, QueryContext};
 
 use log::*;
 use std::collections::{HashMap, HashSet};
@@ -46,21 +47,35 @@ impl Database {
     }
 
     fn update_search_entry(&self, key: u128, name: &str, ts: u64) {
-        match self.rt.ctx_index.resolve_basenames_for_key(key) {
-            Ok(basenames) => {
-                let doc = SearchDocument {
-                    key,
-                    func_name: name.to_string(),
-                    binary_names: basenames,
-                    ts,
-                };
-                if let Err(e) = self.rt.search.index_function(&doc) {
-                    log::warn!("failed to update search index for key {:032x}: {}", key, e);
-                }
-            }
+        self.update_search_entry_no_commit(key, name, ts);
+        if let Err(e) = self.rt.search.commit() {
+            log::warn!("failed to commit search index: {}", e);
+        }
+    }
+
+    fn update_search_entry_no_commit(&self, key: u128, name: &str, ts: u64) {
+        // Get basenames, but still index even if this fails
+        let basenames = match self.rt.ctx_index.resolve_basenames_for_key(key) {
+            Ok(b) => b,
             Err(e) => {
-                log::warn!("failed to gather basenames for key {:032x}: {}", key, e);
+                log::debug!("no basenames for key {:032x}: {}", key, e);
+                Vec::new()
             }
+        };
+        let doc = SearchDocument {
+            key,
+            func_name: name.to_string(),
+            binary_names: basenames,
+            ts,
+        };
+        if let Err(e) = self.rt.search.index_function_no_commit(&doc) {
+            log::warn!("failed to update search index for key {:032x}: {}", key, e);
+        }
+    }
+
+    fn commit_search_index(&self) {
+        if let Err(e) = self.rt.search.commit() {
+            log::warn!("failed to commit search index: {}", e);
         }
     }
 
@@ -105,6 +120,30 @@ impl Database {
         items: &[(u128, u32, u32, &str, &[u8])],
         ctx: &PushContext<'_>,
     ) -> io::Result<Vec<u32>> {
+        // Convert to owned data for spawn_blocking ('static requirement)
+        let owned_items: Vec<(u128, u32, u32, String, Vec<u8>)> = items
+            .iter()
+            .map(|(k, p, l, n, d)| (*k, *p, *l, n.to_string(), d.to_vec()))
+            .collect();
+        let owned_ctx = OwnedPushContext {
+            md5: ctx.md5,
+            basename: ctx.basename.map(|s| s.to_string()),
+            hostname: ctx.hostname.map(|s| s.to_string()),
+        };
+        let rt = self.rt.clone();
+
+        // Move blocking sled I/O to dedicated thread pool
+        tokio::task::spawn_blocking(move || Self::push_with_ctx_sync(&rt, &owned_items, &owned_ctx))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking: {}", e)))?
+    }
+
+    /// Synchronous implementation of push_with_ctx (runs on blocking thread pool).
+    fn push_with_ctx_sync(
+        rt: &EngineRuntime,
+        items: &[(u128, u32, u32, String, Vec<u8>)],
+        ctx: &OwnedPushContext,
+    ) -> io::Result<Vec<u32>> {
         let mut status = Vec::with_capacity(items.len());
         for (key, pop, _len_bytes_decl, name, data) in items.iter() {
             if name.len() > u16::MAX as usize {
@@ -120,12 +159,12 @@ impl Database {
                 ));
             }
 
-            let old = self.rt.index.get(*key);
+            let old = rt.index.get(*key);
 
             if old != 0 {
                 let seg_id = addr_seg(old);
                 let off = addr_off(old);
-                match self.rt.segments.get_reader(seg_id) {
+                match rt.segments.get_reader(seg_id) {
                     Some(reader) => {
                         match reader.read_at(off) {
                             Ok(existing) => {
@@ -135,21 +174,26 @@ impl Database {
                                     if let Some(md5) = ctx.md5 {
                                         let ts = now_ts_sec();
                                         let vid = version_id(*key, name, data);
-                                        let _ = self.rt.ctx_index.record_binary_meta(
+                                        let _ = rt.ctx_index.record_binary_meta(
                                             md5,
-                                            ctx.basename.unwrap_or(""),
-                                            ctx.hostname.unwrap_or(""),
+                                            ctx.basename.as_deref().unwrap_or(""),
+                                            ctx.hostname.as_deref().unwrap_or(""),
                                             ts,
                                         );
-                                        let _ = self.rt.ctx_index.record_key_observation(
+                                        let _ = rt.ctx_index.record_key_observation(
                                             *key,
                                             md5,
                                             Some(vid),
                                             ts,
-                                            ctx.basename,
+                                            ctx.basename.as_deref(),
                                         );
                                     }
-                                    self.update_search_entry(*key, name, existing.ts_sec);
+                                    Self::update_search_entry_no_commit_static(
+                                        rt,
+                                        *key,
+                                        name,
+                                        existing.ts_sec,
+                                    );
                                     continue;
                                 }
                             }
@@ -173,14 +217,14 @@ impl Database {
                 key: *key,
                 ts_sec: now_ts_sec(),
                 prev_addr: old,
-                len_bytes: (*data).len() as u32,
+                len_bytes: data.len() as u32,
                 popularity: *pop,
                 name: name.to_string(),
                 data: data.to_vec(),
                 flags: 0,
             };
-            let addr = self.rt.segments.append(&rec)?;
-            match self.rt.index.upsert(*key, addr) {
+            let addr = rt.segments.append(&rec)?;
+            match rt.index.upsert(*key, addr) {
                 Ok(UpsertResult::Inserted) => {
                     status.push(1);
                     METRICS.inc_indexed_funcs();
@@ -206,23 +250,47 @@ impl Database {
             if let Some(md5) = ctx.md5 {
                 let ts = rec.ts_sec;
                 let vid = version_id(*key, name, data);
-                let _ = self.rt.ctx_index.record_binary_meta(
+                let _ = rt.ctx_index.record_binary_meta(
                     md5,
-                    ctx.basename.unwrap_or(""),
-                    ctx.hostname.unwrap_or(""),
+                    ctx.basename.as_deref().unwrap_or(""),
+                    ctx.hostname.as_deref().unwrap_or(""),
                     ts,
                 );
-                let _ = self.rt.ctx_index.record_key_observation(
+                let _ = rt.ctx_index.record_key_observation(
                     *key,
                     md5,
                     Some(vid),
                     ts,
-                    ctx.basename,
+                    ctx.basename.as_deref(),
                 );
             }
-            self.update_search_entry(*key, name, rec.ts_sec);
+            Self::update_search_entry_no_commit_static(rt, *key, name, rec.ts_sec);
+        }
+        // Commit all search index changes at once
+        if let Err(e) = rt.search.commit() {
+            log::warn!("failed to commit search index: {}", e);
         }
         Ok(status)
+    }
+
+    fn update_search_entry_no_commit_static(rt: &EngineRuntime, key: u128, name: &str, ts: u64) {
+        // Get basenames, but still index even if this fails
+        let basenames = match rt.ctx_index.resolve_basenames_for_key(key) {
+            Ok(b) => b,
+            Err(e) => {
+                log::debug!("no basenames for key {:032x}: {}", key, e);
+                Vec::new()
+            }
+        };
+        let doc = SearchDocument {
+            key,
+            func_name: name.to_string(),
+            binary_names: basenames,
+            ts,
+        };
+        if let Err(e) = rt.search.index_function_no_commit(&doc) {
+            log::warn!("failed to update search index for key {:032x}: {}", key, e);
+        }
     }
 
     /// Delete function metadata by keys.
@@ -563,16 +631,6 @@ fn now_ts_sec() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Extract segment ID from address.
-const fn addr_seg(addr: u64) -> u16 {
-    (addr >> 48) as u16
-}
-
-/// Extract offset from address.
-const fn addr_off(addr: u64) -> u64 {
-    addr & 0x0000_FFFF_FFFF_FFFF
 }
 
 /// Compute version ID from key, name, and data.

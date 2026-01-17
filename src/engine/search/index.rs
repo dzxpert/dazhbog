@@ -79,8 +79,16 @@ impl SearchIndex {
         Ok(self.reader.searcher().num_docs() == 0)
     }
 
-    /// Index a single function document.
+    /// Index a single function document (with immediate commit).
+    /// For bulk operations, use `index_function_batch` instead.
     pub fn index_function(&self, doc: &SearchDocument) -> io::Result<()> {
+        self.index_function_no_commit(doc)?;
+        self.commit()
+    }
+
+    /// Index a single function document without committing.
+    /// Call `commit()` after indexing a batch of documents.
+    pub fn index_function_no_commit(&self, doc: &SearchDocument) -> io::Result<()> {
         let key_hex = format!("{:032x}", doc.key);
         let mut writer = self.writer.lock();
         writer.delete_term(Term::from_field_text(self.fields.key_hex, &key_hex));
@@ -95,6 +103,12 @@ impl SearchIndex {
         writer
             .add_document(tdoc)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("add doc: {e}")))?;
+        Ok(())
+    }
+
+    /// Commit pending changes and reload the reader.
+    pub fn commit(&self) -> io::Result<()> {
+        let mut writer = self.writer.lock();
         writer
             .commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("commit: {e}")))?;
