@@ -49,6 +49,10 @@ pub struct OpenSegments {
     #[allow(dead_code)]
     pub use_mmap: bool,
     pub seg_bytes: u64,
+    /// Cached storage bytes to avoid full scan on every call
+    cached_storage_bytes: std::sync::atomic::AtomicU64,
+    /// Metadata tree for persistent caching
+    meta: sled::Tree,
 }
 
 impl SegmentWriter {
@@ -487,12 +491,45 @@ impl OpenSegments {
             readers.push(SegmentReader::open(&db, sid)?);
         }
 
+        // Open metadata tree for caching
+        let meta = db
+            .open_tree("__meta")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open __meta: {e}")))?;
+
+        // Load cached storage bytes or compute if missing
+        let cached_storage_bytes = if let Some(val) = meta
+            .get(b"storage_bytes")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled get: {e}")))?
+        {
+            let bytes: [u8; 8] = val.as_ref().try_into().unwrap_or([0u8; 8]);
+            std::sync::atomic::AtomicU64::new(u64::from_le_bytes(bytes))
+        } else {
+            // First time or cache missing - compute and store
+            log::info!("Computing storage bytes (first startup or cache missing)...");
+            let total: u64 = readers
+                .iter()
+                .map(|r| {
+                    r.tree
+                        .iter()
+                        .filter_map(|res| res.ok())
+                        .map(|(_, v)| v.len() as u64)
+                        .sum::<u64>()
+                })
+                .sum();
+            meta.insert(b"storage_bytes", &total.to_le_bytes())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled insert: {e}")))?;
+            log::info!("Cached storage bytes: {} MB", total / 1_048_576);
+            std::sync::atomic::AtomicU64::new(total)
+        };
+
         Ok(Self {
             db,
             current: std::sync::Mutex::new(writer),
             readers: parking_lot::Mutex::new(readers),
             use_mmap,
             seg_bytes,
+            cached_storage_bytes,
+            meta,
         })
     }
 
@@ -517,7 +554,7 @@ impl OpenSegments {
 
     pub fn append(&self, rec: &Record) -> io::Result<Addr> {
         let mut writer = self.current.lock().unwrap();
-        match writer.append(rec) {
+        let result = match writer.append(rec) {
             Ok(addr) => Ok(addr),
             Err(e)
                 if e.kind() == io::ErrorKind::Other && e.to_string().contains("segment full") =>
@@ -528,7 +565,26 @@ impl OpenSegments {
                 writer.append(rec)
             }
             Err(e) => Err(e),
+        };
+
+        // Update cached storage bytes on successful append
+        if result.is_ok() {
+            let name_len = rec.name.len() as u16;
+            let data_len = rec.data.len() as u32;
+            let body_len: u64 =
+                8 + 8 + 8 + 8 + 4 + 4 + 2 + 4 + 1 + 5 + (name_len as u64) + (data_len as u64);
+            let total_len = 4 + 4 + 4 + body_len;
+            let new_total = self
+                .cached_storage_bytes
+                .fetch_add(total_len, std::sync::atomic::Ordering::Relaxed)
+                + total_len;
+            // Persist periodically (every ~10MB)
+            if new_total % (10 * 1024 * 1024) < total_len {
+                let _ = self.meta.insert(b"storage_bytes", &new_total.to_le_bytes());
+            }
         }
+
+        result
     }
 
     pub fn rebuild_index(&self, index: &crate::engine::index::ShardedIndex) -> io::Result<()> {
@@ -867,10 +923,10 @@ impl OpenSegments {
         Ok((total_records, written_records, bytes_saved))
     }
 
-    /// Get total storage bytes used by all segments.
+    /// Get total storage bytes used by all segments (cached).
     pub fn get_storage_bytes(&self) -> u64 {
-        let rs = self.readers.lock();
-        self.total_segment_size(&rs)
+        self.cached_storage_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get total record count across all segments.

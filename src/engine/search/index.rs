@@ -5,19 +5,35 @@ use std::{io, path::Path};
 use tantivy::collector::TopDocs;
 
 /// Extract only the filename from a path, stripping directories.
+/// Handles both Unix (/) and Windows (\) path separators regardless of platform.
 /// Prevents leaking usernames or directory structures in API responses.
 fn sanitize_basename(input: &str) -> String {
-    let p = Path::new(input);
-    let base = p
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(input)
-        .trim()
-        .to_string();
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+
+    // Find the last occurrence of either path separator
+    let last_sep = input
+        .rfind('/')
+        .into_iter()
+        .chain(input.rfind('\\'))
+        .max();
+
+    let base = match last_sep {
+        Some(idx) => &input[idx + 1..],
+        None => input,
+    };
+
+    let base = base.trim();
+    if base.is_empty() {
+        return String::new();
+    }
+
     if base.len() > 255 {
         base[..255].to_string()
     } else {
-        base
+        base.to_string()
     }
 }
 use tantivy::query::QueryParser;
@@ -36,6 +52,8 @@ pub struct SearchIndex {
 struct SearchFields {
     key_hex: Field,
     func_name: Field,
+    func_name_demangled: Field,
+    lang: Field,
     binary_name: Field,
     ts: Field,
 }
@@ -96,6 +114,8 @@ impl SearchIndex {
         let mut tdoc = tantivy::Document::new();
         tdoc.add_text(self.fields.key_hex, &key_hex);
         tdoc.add_text(self.fields.func_name, &doc.func_name);
+        tdoc.add_text(self.fields.func_name_demangled, &doc.func_name_demangled);
+        tdoc.add_text(self.fields.lang, &doc.lang);
         tdoc.add_u64(self.fields.ts, doc.ts);
         for bn in &doc.binary_names {
             tdoc.add_text(self.fields.binary_name, bn);
@@ -152,6 +172,8 @@ impl SearchIndex {
             let mut tdoc = tantivy::Document::new();
             tdoc.add_text(self.fields.key_hex, &key_hex);
             tdoc.add_text(self.fields.func_name, &doc.func_name);
+            tdoc.add_text(self.fields.func_name_demangled, &doc.func_name_demangled);
+            tdoc.add_text(self.fields.lang, &doc.lang);
             tdoc.add_u64(self.fields.ts, doc.ts);
             for bn in &doc.binary_names {
                 tdoc.add_text(self.fields.binary_name, bn);
@@ -171,7 +193,7 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Search for functions matching the query.
+    /// Search for functions matching the query. Returns up to `limit` results.
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
         let query = query.trim();
         if query.is_empty() {
@@ -180,10 +202,7 @@ impl SearchIndex {
 
         let searcher = self.reader.searcher();
         let term_lower = query.to_lowercase();
-
-        // Brute force search through stored documents
-        // This is less efficient but guaranteed to work
-        let mut hits = Vec::new();
+        let mut hits = Vec::with_capacity(limit.min(200));
 
         for segment_reader in searcher.segment_readers() {
             let store_reader = segment_reader.get_store_reader(1).map_err(|e| {
@@ -197,19 +216,27 @@ impl SearchIndex {
                         .and_then(|v| v.as_text())
                         .unwrap_or("");
 
+                    let func_name_demangled = doc
+                        .get_first(self.fields.func_name_demangled)
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("");
+
+                    let lang = doc
+                        .get_first(self.fields.lang)
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("");
+
                     let binary_names: Vec<&str> = doc
                         .get_all(self.fields.binary_name)
                         .filter_map(|v| v.as_text())
                         .collect();
 
+                    // Match against mangled name, demangled name, or binary names
                     let func_lower = func_name.to_lowercase();
-
-                    // Also try matching against demangled name
-                    let demangled = crate::common::demangle::demangle_simple(func_name);
-                    let demangled_lower = demangled.to_lowercase();
+                    let demangled_lower = func_name_demangled.to_lowercase();
 
                     let matches = func_lower.contains(&term_lower)
-                        || demangled_lower.contains(&term_lower)
+                        || (!demangled_lower.is_empty() && demangled_lower.contains(&term_lower))
                         || binary_names
                             .iter()
                             .any(|b| b.to_lowercase().contains(&term_lower));
@@ -221,9 +248,11 @@ impl SearchIndex {
                             .unwrap_or("")
                             .to_string();
 
-                        hits.push(SearchHit::new(
+                        hits.push(SearchHit::new_with_demangled(
                             key_hex,
                             func_name.to_string(),
+                            func_name_demangled.to_string(),
+                            lang.to_string(),
                             binary_names
                                 .iter()
                                 .map(|s| sanitize_basename(s))
@@ -258,6 +287,9 @@ fn build_schema() -> Schema {
         .set_indexing_options(ngram_indexing.clone())
         .set_stored();
 
+    // Stored-only fields (no indexing, just for retrieval)
+    let stored_only = TextOptions::default().set_stored();
+
     let key_options = TextOptions::default().set_stored().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer("raw")
@@ -266,6 +298,8 @@ fn build_schema() -> Schema {
 
     builder.add_text_field("key_hex", key_options);
     builder.add_text_field("func_name", text_options.clone());
+    builder.add_text_field("func_name_demangled", stored_only.clone());
+    builder.add_text_field("lang", stored_only);
     builder.add_text_field("binary_name", text_options);
     builder.add_u64_field("ts", STORED);
 
@@ -295,6 +329,15 @@ impl SearchFields {
                 format!("func_name field missing: {e}"),
             )
         })?;
+        let func_name_demangled = schema.get_field("func_name_demangled").map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("func_name_demangled field missing: {e}"),
+            )
+        })?;
+        let lang = schema.get_field("lang").map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("lang field missing: {e}"))
+        })?;
         let binary_name = schema.get_field("binary_name").map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -307,6 +350,8 @@ impl SearchFields {
         Ok(Self {
             key_hex,
             func_name,
+            func_name_demangled,
+            lang,
             binary_name,
             ts,
         })

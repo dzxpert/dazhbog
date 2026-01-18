@@ -152,12 +152,11 @@ pub async fn handle_search(db: Arc<Database>, req: Request<Incoming>) -> Respons
             StatusCode::BAD_REQUEST,
         );
     };
-    let limit = parse_query_param(&req, "limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.min(100))
-        .unwrap_or(25);
 
-    match db.search_functions(&q, limit).await {
+    // Max 25 results
+    const MAX_RESULTS: usize = 25;
+
+    match db.search_functions(&q, MAX_RESULTS).await {
         Ok(results) => json_response(&SearchResponse { query: q, results }, StatusCode::OK),
         Err(e) => {
             error!("search failed: {}", e);

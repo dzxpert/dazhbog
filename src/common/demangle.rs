@@ -87,11 +87,19 @@ fn try_demangle_rust(name: &str) -> Option<DemangleResult> {
     }
 
     match rustc_demangle::try_demangle(name) {
-        Ok(demangled) => Some(DemangleResult {
-            name: format!("{:#}", demangled), // Use alternate format for cleaner output
-            demangled: true,
-            lang: Some("rust"),
-        }),
+        Ok(demangled) => {
+            // Use write! to handle potential Display errors gracefully
+            let mut result = String::new();
+            if std::fmt::Write::write_fmt(&mut result, format_args!("{:#}", demangled)).is_ok() {
+                Some(DemangleResult {
+                    name: result,
+                    demangled: true,
+                    lang: Some("rust"),
+                })
+            } else {
+                None
+            }
+        }
         Err(_) => None,
     }
 }
@@ -152,12 +160,18 @@ fn try_demangle_itanium(name: &str) -> Option<DemangleResult> {
 
     match cpp_demangle::Symbol::new(to_demangle) {
         Ok(sym) => {
-            let demangled = sym.to_string();
-            Some(DemangleResult {
-                name: demangled,
-                demangled: true,
-                lang: Some("c++"),
-            })
+            // Use write! to handle potential Display errors gracefully
+            // (to_string() panics if Display::fmt returns an error)
+            let mut demangled = String::new();
+            if std::fmt::Write::write_fmt(&mut demangled, format_args!("{}", sym)).is_ok() {
+                Some(DemangleResult {
+                    name: demangled,
+                    demangled: true,
+                    lang: Some("c++"),
+                })
+            } else {
+                None
+            }
         }
         Err(_) => None,
     }

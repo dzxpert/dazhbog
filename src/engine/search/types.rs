@@ -7,6 +7,10 @@ use serde::Serialize;
 pub struct SearchDocument {
     pub key: u128,
     pub func_name: String,
+    /// Pre-computed demangled name (empty string if not demangled)
+    pub func_name_demangled: String,
+    /// Detected language from demangling (empty string if not detected)
+    pub lang: String,
     pub binary_names: Vec<String>,
     pub ts: u64,
 }
@@ -25,17 +29,22 @@ pub struct SearchHit {
 }
 
 impl SearchHit {
-    /// Create a new SearchHit with automatic demangling
-    pub fn new(key_hex: String, func_name: String, binary_names: Vec<String>, score: f32) -> Self {
-        let demangle_result = crate::common::demangle::demangle(&func_name);
-
-        let (func_name_demangled, lang) = if demangle_result.demangled {
-            (
-                Some(demangle_result.name),
-                demangle_result.lang.map(|s| s.to_string()),
-            )
-        } else {
+    /// Create a new SearchHit with pre-computed demangled name
+    pub fn new_with_demangled(
+        key_hex: String,
+        func_name: String,
+        func_name_demangled: String,
+        lang: String,
+        binary_names: Vec<String>,
+        score: f32,
+    ) -> Self {
+        let (func_name_demangled, lang) = if func_name_demangled.is_empty() {
             (None, None)
+        } else {
+            (
+                Some(func_name_demangled),
+                if lang.is_empty() { None } else { Some(lang) },
+            )
         };
 
         Self {

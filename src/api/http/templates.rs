@@ -836,6 +836,56 @@ pub const HOME: &str = r#"<!doctype html>
         }
         
         /* ─────────────────────────────────────────────────────────────
+           PAGINATION CONTROLS
+           ───────────────────────────────────────────────────────────── */
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: var(--space-sm);
+            padding: var(--space-lg);
+            border-top: 1px solid var(--border-dim);
+            background: var(--bg-element);
+        }
+
+        .pagination-btn {
+            background: var(--bg-panel);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-secondary);
+            padding: var(--space-sm) var(--space-md);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .pagination-btn:hover:not(:disabled) {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: var(--accent-glow);
+        }
+
+        .pagination-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .pagination-info {
+            font-size: 11px;
+            color: var(--text-dim);
+            letter-spacing: 0.1em;
+            padding: 0 var(--space-md);
+        }
+
+        .pagination-info .accent {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        /* ─────────────────────────────────────────────────────────────
            EMPTY / LOADING STATES
            ───────────────────────────────────────────────────────────── */
         
@@ -1061,13 +1111,13 @@ pub const HOME: &str = r#"<!doctype html>
                 <span class="search-prompt">&gt;&gt;&gt;</span>
                 <div class="search-input-wrap">
                     <input type="text" id="q" class="search-input" placeholder="ENTER QUERY: function name, binary, or address..." autocomplete="off" spellcheck="false">
-                    <span class="search-kbd">ENTER</span>
+                    <span class="search-kbd">LIVE</span>
                 </div>
             </div>
             <div class="search-meta">
                 <span>MODE: <span class="accent">FULL-TEXT</span></span>
                 <span>INDEX: <span class="accent" id="index-status">READY</span></span>
-                <span>LIMIT: <span class="accent">25</span></span>
+                <span>MAX: <span class="accent">25</span></span>
                 <span>PRESS <span class="accent">/</span> TO FOCUS</span>
             </div>
         </section>
@@ -1387,13 +1437,10 @@ pub const HOME: &str = r#"<!doctype html>
            DAZHBOG TERMINAL INTERFACE - AXIOM CONTROL SYSTEM
            Document: DZB-JS-001 // Classification: OPERATIONAL
            ═══════════════════════════════════════════════════════════════ */
-        
+
         const el = {
-            // Search
             q: document.getElementById('q'),
             indexStatus: document.getElementById('index-status'),
-            
-            // Dashboard
             dashboard: document.getElementById('dashboard'),
             secondary: document.getElementById('metrics-secondary'),
             results: document.getElementById('results'),
@@ -1401,21 +1448,15 @@ pub const HOME: &str = r#"<!doctype html>
             resultsCount: document.getElementById('results-count'),
             resultsLatency: document.getElementById('results-latency'),
             resultsQuery: document.getElementById('results-query'),
-            
-            // Status
             statusRing: document.getElementById('status-ring'),
             statusLabel: document.getElementById('status-label'),
             timestamp: document.getElementById('timestamp'),
             uptime: document.getElementById('uptime'),
             sysTime: document.getElementById('sys-time'),
-            
-            // Database Stats
             mIndexed: document.getElementById('m-indexed'),
             mStorage: document.getElementById('m-storage'),
             mSearchDocs: document.getElementById('m-searchdocs'),
             mBinaries: document.getElementById('m-binaries'),
-            
-            // Traffic Metrics
             mQueried: document.getElementById('m-queried'),
             mRpc: document.getElementById('m-rpc'),
             mUpstream: document.getElementById('m-upstream'),
@@ -1424,16 +1465,12 @@ pub const HOME: &str = r#"<!doctype html>
             mPulls: document.getElementById('m-pulls'),
             mPushes: document.getElementById('m-pushes'),
             mScoring: document.getElementById('m-scoring'),
-            
-            // Error Metrics
             mErrors: document.getElementById('m-errors'),
             mTimeouts: document.getElementById('m-timeouts'),
             mRejects: document.getElementById('m-rejects'),
             mAppend: document.getElementById('m-append'),
             mOverflow: document.getElementById('m-overflow'),
             mUpErr: document.getElementById('m-uperr'),
-            
-            // Telemetry
             telStorage: document.getElementById('tel-storage'),
             telIndex: document.getElementById('tel-index'),
             telNetwork: document.getElementById('tel-network'),
@@ -1441,55 +1478,51 @@ pub const HOME: &str = r#"<!doctype html>
             protoV5: document.getElementById('proto-v5'),
             protoV0: document.getElementById('proto-v0'),
         };
-        
-        // Format number with commas
+
+        let searchDebounceTimer = null;
+        const DEBOUNCE_MS = 300;
+
         const fmt = n => Number(n).toLocaleString();
-        
-        // Format bytes to human readable
         const fmtBytes = b => {
             if (b === 0) return '0 B';
-            const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(b) / Math.log(k));
             return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         };
-        
-        // Format uptime from seconds
         const fmtUptime = secs => {
-            const days = Math.floor(secs / 86400);
-            const hours = Math.floor((secs % 86400) / 3600);
-            const mins = Math.floor((secs % 3600) / 60);
-            return `${days}d ${hours}h ${mins}m`;
+            const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+            return `${d}d ${h}h ${m}m`;
         };
-        
-        // Escape HTML
         const esc = s => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        
-        // Update system time
+
+        function parseHash() {
+            const params = new URLSearchParams(window.location.hash.slice(1));
+            return params.get('q') || '';
+        }
+
+        function updateHash(query) {
+            if (query) {
+                window.location.hash = 'q=' + encodeURIComponent(query);
+            } else {
+                history.replaceState(null, '', window.location.pathname);
+            }
+        }
+
         function updateTime() {
             const now = new Date();
-            const time = now.toTimeString().split(' ')[0];
-            const date = now.toISOString().split('T')[0];
-            el.timestamp.textContent = time;
-            el.sysTime.textContent = `${date} ${time} UTC`;
+            el.timestamp.textContent = now.toTimeString().split(' ')[0];
+            el.sysTime.textContent = `${now.toISOString().split('T')[0]} ${now.toTimeString().split(' ')[0]} UTC`;
         }
-        
-        // Fetch and update metrics
-        let metricsTimer = null;
-        
+
         async function fetchMetrics() {
             try {
                 const r = await fetch('/api/metrics');
                 if (!r.ok) throw new Error(r.status);
                 const d = await r.json();
-                
-                // Update database stats
                 el.mIndexed.textContent = fmt(d.indexed_funcs || 0);
                 el.mStorage.textContent = fmtBytes(d.storage_bytes || 0);
                 el.mSearchDocs.textContent = fmt(d.search_docs || 0);
                 el.mBinaries.textContent = fmt(d.unique_binaries || 0);
-                
-                // Update traffic metrics
                 el.mQueried.textContent = fmt(d.queried_funcs || 0);
                 el.mRpc.textContent = fmt(d.active_connections || 0);
                 el.mUpstream.textContent = fmt(d.upstream_requests || 0);
@@ -1498,34 +1531,23 @@ pub const HOME: &str = r#"<!doctype html>
                 el.mPulls.textContent = fmt(d.pulls || 0);
                 el.mPushes.textContent = fmt(d.pushes || 0);
                 el.mScoring.textContent = fmt(d.scoring_batches || 0);
-                
-                // Update error metrics
                 el.mErrors.textContent = fmt(d.errors || 0);
                 el.mTimeouts.textContent = fmt(d.timeouts || 0);
                 el.mRejects.textContent = fmt(d.decoder_rejects || 0);
                 el.mAppend.textContent = fmt(d.append_failures || 0);
                 el.mOverflow.textContent = fmt(d.index_overflows || 0);
                 el.mUpErr.textContent = fmt(d.upstream_errors || 0);
-                
-                // Update protocol counters
                 el.protoV5.textContent = fmt(d.lumina_v5p || 0);
                 el.protoV0.textContent = fmt(d.lumina_v0_4 || 0);
-                
-                // Update status
                 el.statusRing.classList.remove('offline');
                 el.statusLabel.classList.remove('offline');
                 el.statusLabel.textContent = 'OPERATIONAL';
                 el.indexStatus.textContent = 'READY';
-                
-                // Update telemetry dots
                 el.telStorage.className = 'dot ' + ((d.append_failures || 0) > 0 ? 'error' : 'active');
                 el.telIndex.className = 'dot ' + ((d.index_overflows || 0) > 0 ? 'warn' : 'active');
                 el.telNetwork.className = 'dot ' + ((d.errors || 0) > 0 ? 'warn' : 'active');
                 el.telUpstream.className = 'dot ' + ((d.upstream_requests || 0) > 0 ? 'active' : '');
-                
-                // Update uptime from server
                 el.uptime.textContent = fmtUptime(d.uptime_secs || 0);
-                
             } catch (e) {
                 el.statusRing.classList.add('offline');
                 el.statusLabel.classList.add('offline');
@@ -1533,125 +1555,83 @@ pub const HOME: &str = r#"<!doctype html>
                 el.indexStatus.textContent = 'ERROR';
             }
         }
-        
-        // Run search
-        async function runSearch() {
-            const query = el.q.value.trim();
-            if (!query) {
-                el.dashboard.classList.remove('hidden');
-                el.secondary.classList.remove('hidden');
-                el.results.classList.remove('active');
-                return;
-            }
-            
+
+        function showDashboard() {
+            el.dashboard.classList.remove('hidden');
+            el.secondary.classList.remove('hidden');
+            el.results.classList.remove('active');
+            updateHash('');
+        }
+
+        async function runSearch(query, updateUrl = true) {
+            query = query.trim();
+            if (!query) { showDashboard(); return; }
+
             el.dashboard.classList.add('hidden');
             el.secondary.classList.add('hidden');
             el.results.classList.add('active');
             el.resultsQuery.textContent = query;
-            el.resultsList.innerHTML = `
-                <div class="state-message">
-                    <div class="icon">&gt;&gt;&gt;</div>
-                    <h3>QUERYING INDEX</h3>
-                    <p>Processing request...</p>
-                </div>
-            `;
-            
+            el.resultsList.innerHTML = '<div class="state-message"><div class="icon">&gt;&gt;&gt;</div><h3>QUERYING INDEX</h3><p>Processing request...</p></div>';
+
+            if (updateUrl) updateHash(query);
+
             const t0 = performance.now();
             try {
-                const r = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+                const r = await fetch('/api/search?q=' + encodeURIComponent(query));
                 if (!r.ok) throw new Error('Query failed: ' + r.status);
                 const d = await r.json();
-                const t1 = performance.now();
-                renderResults(d.results, query, t1 - t0);
+                renderResults(d.results, query, performance.now() - t0);
             } catch (e) {
-                el.resultsList.innerHTML = `
-                    <div class="state-message">
-                        <div class="icon">!</div>
-                        <h3>QUERY ERROR</h3>
-                        <p>${esc(e.message)}</p>
-                    </div>
-                `;
+                el.resultsList.innerHTML = '<div class="state-message"><div class="icon">!</div><h3>QUERY ERROR</h3><p>' + esc(e.message) + '</p></div>';
                 el.resultsCount.textContent = '0';
             }
         }
-        
-        // Render search results
+
         function renderResults(hits, query, latency) {
             el.resultsLatency.textContent = latency.toFixed(1) + 'ms';
-            
             if (!hits || hits.length === 0) {
                 el.resultsCount.textContent = '0';
-                el.resultsList.innerHTML = `
-                    <div class="state-message">
-                        <div class="icon">[ ]</div>
-                        <h3>NO MATCHES FOUND</h3>
-                        <p>Query "${esc(query)}" returned no results.</p>
-                    </div>
-                `;
+                el.resultsList.innerHTML = '<div class="state-message"><div class="icon">[ ]</div><h3>NO MATCHES FOUND</h3><p>Query "' + esc(query) + '" returned no results.</p></div>';
                 return;
             }
-            
             el.resultsCount.textContent = hits.length;
-            
-            const html = hits.map((h, i) => {
-                const bins = (h.binary_names || []).map(b => 
-                    `<span class="bin-tag">${esc(b)}</span>`
-                ).join('');
-                
-                const idx = String(i + 1).padStart(2, '0');
-                
-                // Show demangled name if available, with language badge
+            el.resultsList.innerHTML = hits.map((h, i) => {
+                const bins = (h.binary_names || []).map(b => '<span class="bin-tag">' + esc(b) + '</span>').join('');
                 const displayName = h.func_name_demangled || h.func_name;
-                const langBadge = h.lang ? `<span class="lang-badge">${esc(h.lang.toUpperCase())}</span>` : '';
-                const mangledHint = h.func_name_demangled ? 
-                    `<div class="result-mangled" title="Mangled name">${esc(h.func_name)}</div>` : '';
-                
-                return `
-                    <div class="result-item">
-                        <div class="result-index">${idx}</div>
-                        <div class="result-main">
-                            <div class="result-func">${esc(displayName)}</div>
-                            ${mangledHint}
-                            <div class="result-key">KEY ${esc(h.key_hex)}</div>
-                            <div class="result-bins">${bins}</div>
-                        </div>
-                        <div class="result-meta">
-                            ${langBadge}
-                            <span class="version-badge">V${h.version || 0}</span>
-                            <span class="score-badge">SCORE ${Number(h.score).toFixed(2)}</span>
-                        </div>
-                    </div>
-                `;
+                const langBadge = h.lang ? '<span class="lang-badge">' + esc(h.lang.toUpperCase()) + '</span>' : '';
+                const mangledHint = h.func_name_demangled ? '<div class="result-mangled" title="Mangled name">' + esc(h.func_name) + '</div>' : '';
+                return '<div class="result-item"><div class="result-index">' + String(i + 1).padStart(2, '0') + '</div><div class="result-main"><div class="result-func">' + esc(displayName) + '</div>' + mangledHint + '<div class="result-key">KEY ' + esc(h.key_hex) + '</div><div class="result-bins">' + bins + '</div></div><div class="result-meta">' + langBadge + '<span class="version-badge">V' + (h.version || 0) + '</span><span class="score-badge">SCORE ' + Number(h.score).toFixed(2) + '</span></div></div>';
             }).join('');
-            
-            el.resultsList.innerHTML = html;
         }
-        
-        // Event listeners
+
+        function handleSearchInput() {
+            if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(() => runSearch(el.q.value), DEBOUNCE_MS);
+        }
+
+        el.q.addEventListener('input', handleSearchInput);
         el.q.addEventListener('keydown', e => {
-            if (e.key === 'Enter') runSearch();
-        });
-        
-        el.q.addEventListener('input', () => {
-            if (el.q.value.trim() === '') {
-                el.dashboard.classList.remove('hidden');
-                el.secondary.classList.remove('hidden');
-                el.results.classList.remove('active');
+            if (e.key === 'Enter') {
+                if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
+                runSearch(el.q.value);
             }
         });
-        
         document.addEventListener('keydown', e => {
-            if (e.key === '/' && document.activeElement !== el.q) {
-                e.preventDefault();
-                el.q.focus();
-            }
+            if (e.key === '/' && document.activeElement !== el.q) { e.preventDefault(); el.q.focus(); }
         });
-        
-        // Initialize
+        window.addEventListener('hashchange', () => {
+            const q = parseHash();
+            el.q.value = q;
+            if (q) runSearch(q, false); else showDashboard();
+        });
+
         updateTime();
         setInterval(updateTime, 1000);
         fetchMetrics();
-        metricsTimer = setInterval(fetchMetrics, 5000);
+        setInterval(fetchMetrics, 5000);
+
+        const initQ = parseHash();
+        if (initQ) { el.q.value = initQ; runSearch(initQ, false); }
     </script>
 </body>
 </html>

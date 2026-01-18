@@ -1,6 +1,7 @@
 //! Main database implementation for function metadata storage.
 
 use crate::api::metrics::METRICS;
+use crate::common::demangle::demangle;
 use crate::common::{addr_off, addr_seg};
 use crate::config::Config;
 use crate::engine::{EngineRuntime, IndexError, Record, UpsertResult};
@@ -62,9 +63,23 @@ impl Database {
                 Vec::new()
             }
         };
+
+        // Pre-compute demangled name
+        let demangle_result = demangle(name);
+        let (func_name_demangled, lang) = if demangle_result.demangled {
+            (
+                demangle_result.name,
+                demangle_result.lang.unwrap_or("").to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         let doc = SearchDocument {
             key,
             func_name: name.to_string(),
+            func_name_demangled,
+            lang,
             binary_names: basenames,
             ts,
         };
@@ -282,9 +297,23 @@ impl Database {
                 Vec::new()
             }
         };
+
+        // Pre-compute demangled name
+        let demangle_result = demangle(name);
+        let (func_name_demangled, lang) = if demangle_result.demangled {
+            (
+                demangle_result.name,
+                demangle_result.lang.unwrap_or("").to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         let doc = SearchDocument {
             key,
             func_name: name.to_string(),
+            func_name_demangled,
+            lang,
             binary_names: basenames,
             ts,
         };
@@ -345,7 +374,7 @@ impl Database {
         Ok(out)
     }
 
-    /// Search functions by query string.
+    /// Search functions by query string. Returns up to `limit` results.
     pub async fn search_functions(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
         self.rt.search.search(query, limit)
     }

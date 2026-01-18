@@ -2,6 +2,7 @@
 
 use super::index::SearchIndex;
 use super::types::SearchDocument;
+use crate::common::demangle::demangle;
 use crate::engine::{ContextIndex, OpenSegments, ShardedIndex};
 use log::info;
 use std::io;
@@ -39,9 +40,23 @@ pub fn rebuild_from_engine(
     for (key, (ts, name)) in latest.into_iter() {
         // Get basenames if available, but don't fail if context index is empty
         let basenames = ctx_index.resolve_basenames_for_key(key).unwrap_or_default();
+
+        // Pre-compute demangled name at index time
+        let demangle_result = demangle(&name);
+        let (func_name_demangled, lang) = if demangle_result.demangled {
+            (
+                demangle_result.name,
+                demangle_result.lang.unwrap_or("").to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         docs.push(SearchDocument {
             key,
             func_name: name,
+            func_name_demangled,
+            lang,
             binary_names: basenames,
             ts,
         });
