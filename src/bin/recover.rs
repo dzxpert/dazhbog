@@ -4,6 +4,32 @@ use std::{io, path::PathBuf};
 
 const MAGIC: u32 = 0x4C4D4E31;
 
+/// Decode basenames from context index format.
+/// Format: count:u8, then for each: len:u16_le, bytes
+fn decode_basenames(mut b: &[u8]) -> Option<Vec<String>> {
+    if b.is_empty() {
+        return Some(Vec::new());
+    }
+    let count = b[0] as usize;
+    b = &b[1..];
+
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if b.len() < 2 {
+            return None;
+        }
+        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+        b = &b[2..];
+        if b.len() < len {
+            return None;
+        }
+        let s = std::str::from_utf8(&b[..len]).ok()?.to_string();
+        b = &b[len..];
+        out.push(s);
+    }
+    Some(out)
+}
+
 /// Pack segment ID, offset, and flags into a single 64-bit address.
 const fn pack_addr(seg_id: u16, offset: u64, flags: u8) -> u64 {
     ((seg_id as u64) << 48) | ((offset & ((1u64 << 40) - 1)) << 8) | (flags as u64)
@@ -230,10 +256,64 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  --rebuild-index [DATA_DIR]   Rebuild the key->addr index from segment data");
     eprintln!("  --rebuild-search [DATA_DIR]  Rebuild the full-text search index");
+    eprintln!("  --rebuild-basenames [DATA_DIR]  Populate ctx.key_basenames from ctx.binary_meta");
     eprintln!("  --full-recover [DATA_DIR]    Full recovery with deduplication");
+    eprintln!("  --list-trees [DATA_DIR]      List all sled trees and their sizes");
     eprintln!("  --help                       Show this help message");
     eprintln!();
     eprintln!("Default DATA_DIR is 'data/'");
+}
+
+fn list_trees(data_dir: &PathBuf) -> io::Result<()> {
+    println!("=== Dazhbog Database Inspector ===\n");
+    println!("Data directory: {}", data_dir.display());
+
+    // Check segments_db
+    let seg_db_dir = data_dir.join("segments_db");
+    if seg_db_dir.exists() {
+        println!("\n--- segments_db ---");
+        let db = sled::open(&seg_db_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
+        for name in db.tree_names() {
+            let name_str = String::from_utf8_lossy(&name);
+            let tree = db
+                .open_tree(&name)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+            println!("  {:30} {:>12} entries", name_str, tree.len());
+        }
+    }
+
+    // Check index_db (contains main index + context trees)
+    let index_db_dir = data_dir.join("index_db");
+    if index_db_dir.exists() {
+        println!("\n--- index_db ---");
+        let db = sled::open(&index_db_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
+        for name in db.tree_names() {
+            let name_str = String::from_utf8_lossy(&name);
+            let tree = db
+                .open_tree(&name)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+            println!("  {:30} {:>12} entries", name_str, tree.len());
+        }
+    }
+
+    // Also check old-style "index" folder (before rename to index_db)
+    let index_dir = data_dir.join("index");
+    if index_dir.exists() {
+        println!("\n--- index (legacy) ---");
+        let db = sled::open(&index_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
+        for name in db.tree_names() {
+            let name_str = String::from_utf8_lossy(&name);
+            let tree = db
+                .open_tree(&name)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+            println!("  {:30} {:>12} entries", name_str, tree.len());
+        }
+    }
+
+    Ok(())
 }
 
 fn rebuild_index(data_dir: &PathBuf) -> io::Result<()> {
@@ -399,9 +479,178 @@ fn rebuild_index(data_dir: &PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+/// Decode binary metadata from ctx.binary_meta format
+fn decode_binary_meta_basename(b: &[u8]) -> Option<String> {
+    // Format: md5[16] + first_seen_ts[8] + last_seen_ts[8] + obs_count[8] + basename_len[2] + basename + ...
+    if b.len() < 16 + 8 + 8 + 8 + 2 {
+        return None;
+    }
+    let mut offset = 16 + 8 + 8 + 8; // skip md5 + timestamps + obs_count
+    let basename_len = u16::from_le_bytes([b[offset], b[offset + 1]]) as usize;
+    offset += 2;
+    if b.len() < offset + basename_len {
+        return None;
+    }
+    std::str::from_utf8(&b[offset..offset + basename_len])
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// Decode key_bins to get list of MD5s for a key
+fn decode_key_bins_md5s(b: &[u8]) -> Vec<[u8; 16]> {
+    if b.is_empty() {
+        return Vec::new();
+    }
+    let count = b[0] as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut offset = 1;
+    for _ in 0..count {
+        if offset + 16 + 4 > b.len() {
+            break;
+        }
+        let mut md5 = [0u8; 16];
+        md5.copy_from_slice(&b[offset..offset + 16]);
+        out.push(md5);
+        offset += 16 + 4; // md5 + obs_count
+    }
+    out
+}
+
+/// Encode basenames for ctx.key_basenames
+fn encode_basenames_for_key(names: &[String]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + names.len() * 18);
+    v.push(names.len().min(255) as u8);
+    for name in names.iter().take(16) {
+        let b = name.as_bytes();
+        let len = b.len().min(u16::MAX as usize) as u16;
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(&b[..len as usize]);
+    }
+    v
+}
+
+fn rebuild_basenames(data_dir: &PathBuf) -> io::Result<()> {
+    // Server uses "index" folder, not "index_db"
+    let index_dir = data_dir.join("index");
+
+    if !index_dir.exists() {
+        eprintln!("Error: {}/index directory not found.", data_dir.display());
+        std::process::exit(1);
+    }
+
+    println!("=== Dazhbog Basenames Rebuild Tool ===\n");
+    println!("Data directory: {}", data_dir.display());
+
+    let db = sled::open(&index_dir)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open: {}", e)))?;
+
+    // Open required trees
+    let key_bins = db
+        .open_tree("ctx.key_bins")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open ctx.key_bins: {}", e)))?;
+    let binary_meta = db.open_tree("ctx.binary_meta").map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("open ctx.binary_meta: {}", e))
+    })?;
+    let key_basenames = db.open_tree("ctx.key_basenames").map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("open ctx.key_basenames: {}", e),
+        )
+    })?;
+
+    println!("ctx.key_bins:      {} entries", key_bins.len());
+    println!("ctx.binary_meta:   {} entries", binary_meta.len());
+    println!(
+        "ctx.key_basenames: {} entries (before)",
+        key_basenames.len()
+    );
+
+    // Build md5 -> basename lookup from binary_meta
+    println!("\nBuilding MD5 -> basename lookup...");
+    let mut md5_to_basename: HashMap<[u8; 16], String> = HashMap::new();
+    for item in binary_meta.iter() {
+        let (md5_key, meta_val) = match item {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        if md5_key.len() != 16 {
+            continue;
+        }
+        if let Some(basename) = decode_binary_meta_basename(&meta_val) {
+            if !basename.is_empty() {
+                let mut md5 = [0u8; 16];
+                md5.copy_from_slice(&md5_key);
+                md5_to_basename.insert(md5, basename);
+            }
+        }
+    }
+    println!("  Found {} binaries with basenames", md5_to_basename.len());
+
+    // Iterate key_bins and populate key_basenames
+    println!("\nPopulating ctx.key_basenames...");
+    let mut processed = 0u64;
+    let mut populated = 0u64;
+
+    for item in key_bins.iter() {
+        let (key_bytes, bins_val) = match item {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+
+        // Decode the MD5 list for this key
+        let md5s = decode_key_bins_md5s(&bins_val);
+
+        // Look up basenames for each MD5
+        let mut basenames: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for md5 in md5s {
+            if let Some(basename) = md5_to_basename.get(&md5) {
+                let lower = basename.to_lowercase();
+                if seen.insert(lower) && basenames.len() < 16 {
+                    basenames.push(basename.clone());
+                }
+            }
+        }
+
+        if !basenames.is_empty() {
+            let encoded = encode_basenames_for_key(&basenames);
+            key_basenames
+                .insert(&key_bytes, encoded)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("insert: {}", e)))?;
+            populated += 1;
+        }
+
+        processed += 1;
+        if processed % 100000 == 0 {
+            print!(
+                "\r  Processed {} keys, {} populated...",
+                processed, populated
+            );
+        }
+    }
+
+    db.flush()?;
+
+    println!(
+        "\r  Processed {} keys, {} populated    ",
+        processed, populated
+    );
+    println!(
+        "\nctx.key_basenames: {} entries (after)",
+        key_basenames.len()
+    );
+    println!("\n=== Basenames Rebuild Complete ===");
+    println!("You can now run --rebuild-search to update the search index.");
+
+    Ok(())
+}
+
 fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     let seg_db_dir = data_dir.join("segments_db");
     let search_dir = data_dir.join("search_index");
+    // Server uses "index" folder, not "index_db"
+    let index_dir = data_dir.join("index");
 
     if !seg_db_dir.exists() {
         eprintln!(
@@ -413,6 +662,34 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
 
     println!("=== Dazhbog Search Index Rebuild Tool ===\n");
     println!("Data directory: {}", data_dir.display());
+
+    // Open index database for context (binary names are stored in ctx.key_basenames tree)
+    let ctx_basenames_tree: Option<sled::Tree> = if index_dir.exists() {
+        println!("Found index database at {}", index_dir.display());
+        let index_db = sled::open(&index_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open index: {}", e)))?;
+        // Context trees use "ctx." prefix in the index database
+        match index_db.open_tree("ctx.key_basenames") {
+            Ok(tree) => {
+                println!("  Opened ctx.key_basenames tree ({} entries)", tree.len());
+                if tree.is_empty() {
+                    println!(
+                        "  Warning: ctx.key_basenames is empty, run --rebuild-basenames first"
+                    );
+                    None
+                } else {
+                    Some(tree)
+                }
+            }
+            Err(e) => {
+                eprintln!("  Warning: could not open ctx.key_basenames: {}", e);
+                None
+            }
+        }
+    } else {
+        println!("No index database found, binary names will be empty");
+        None
+    };
 
     // Open the segments database
     let seg_db = sled::open(&seg_db_dir)
@@ -562,6 +839,7 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
 
     println!("\nIndexing {} functions...", latest_by_key.len());
     let mut indexed = 0u64;
+    let mut with_basenames = 0u64;
 
     for (k, (ts_val, name)) in latest_by_key.iter() {
         let key_hex_str = format!("{:032x}", k);
@@ -569,7 +847,21 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
         doc.add_text(key_hex, &key_hex_str);
         doc.add_text(func_name, name);
         doc.add_u64(ts, *ts_val);
-        // Note: binary_name not populated (would need context index)
+
+        // Look up binary names from context database
+        if let Some(ref tree) = ctx_basenames_tree {
+            let key_bytes = k.to_le_bytes();
+            if let Ok(Some(val)) = tree.get(&key_bytes) {
+                if let Some(basenames) = decode_basenames(&val) {
+                    if !basenames.is_empty() {
+                        // Join basenames with space for search indexing
+                        let binary_names_str = basenames.join(" ");
+                        doc.add_text(_binary_name, &binary_names_str);
+                        with_basenames += 1;
+                    }
+                }
+            }
+        }
 
         writer
             .add_document(doc)
@@ -577,18 +869,25 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
 
         indexed += 1;
         if indexed % 10000 == 0 {
-            print!("\r  Indexed {} functions...", indexed);
+            print!(
+                "\r  Indexed {} functions ({} with binaries)...",
+                indexed, with_basenames
+            );
         }
     }
 
-    println!("\r  Indexed {} functions", indexed);
+    println!(
+        "\r  Indexed {} functions ({} with binaries)",
+        indexed, with_basenames
+    );
     println!("\nCommitting...");
     writer
         .commit()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("commit: {}", e)))?;
 
     println!("\n=== Search Index Rebuild Complete ===");
-    println!("✓ Indexed {} functions", indexed);
+    println!("  Indexed {} functions", indexed);
+    println!("  {} functions have binary names", with_basenames);
     println!("\nYou can now restart the dazhbog server.");
 
     Ok(())
@@ -614,6 +913,12 @@ fn main() -> io::Result<()> {
         }
         Some("--rebuild-search") => {
             return rebuild_search(&data_path);
+        }
+        Some("--rebuild-basenames") => {
+            return rebuild_basenames(&data_path);
+        }
+        Some("--list-trees") => {
+            return list_trees(&data_path);
         }
         Some("--full-recover") | None => {
             // Continue with full recovery below

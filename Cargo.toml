@@ -43,6 +43,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tantivy = { version = "0.21", default-features = false, features = ["mmap", "lz4-compression"] }
 percent-encoding = "2"
+cpp_demangle = "0.4"
+msvc-demangler = "0.10"
+rustc-demangle = "0.1"
+symbolic-demangle = { version = "12", default-features = false, features = ["cpp", "msvc", "rust", "swift"] }
 
 [patch.crates-io]
 zstd-safe = { path = "vendor/zstd-safe" }

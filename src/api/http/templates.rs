@@ -767,11 +767,32 @@ pub const HOME: &str = r#"<!doctype html>
             gap: var(--space-sm);
         }
         
-        .result-key::before {
-            content: "KEY";
+        .result-mangled {
+            font-size: 10px;
+            color: var(--text-tertiary);
+            font-family: var(--font-mono);
+            word-break: break-all;
+            line-height: 1.3;
+            margin-top: 2px;
+            padding: 4px 6px;
+            background: rgba(0, 0, 0, 0.3);
+            border-left: 2px solid var(--text-tertiary);
+            max-height: 40px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .result-mangled:hover {
+            max-height: none;
+            background: rgba(0, 0, 0, 0.5);
+        }
+        
+        .lang-badge {
             font-size: 9px;
             font-weight: 700;
-            color: var(--text-tertiary);
+            color: var(--bg-void);
+            background: var(--state-info);
+            padding: 2px 6px;
             letter-spacing: 0.1em;
         }
         
@@ -1579,15 +1600,23 @@ pub const HOME: &str = r#"<!doctype html>
                 
                 const idx = String(i + 1).padStart(2, '0');
                 
+                // Show demangled name if available, with language badge
+                const displayName = h.func_name_demangled || h.func_name;
+                const langBadge = h.lang ? `<span class="lang-badge">${esc(h.lang.toUpperCase())}</span>` : '';
+                const mangledHint = h.func_name_demangled ? 
+                    `<div class="result-mangled" title="Mangled name">${esc(h.func_name)}</div>` : '';
+                
                 return `
                     <div class="result-item">
                         <div class="result-index">${idx}</div>
                         <div class="result-main">
-                            <div class="result-func">${esc(h.func_name)}</div>
-                            <div class="result-key">${esc(h.key_hex)}</div>
+                            <div class="result-func">${esc(displayName)}</div>
+                            ${mangledHint}
+                            <div class="result-key">KEY ${esc(h.key_hex)}</div>
                             <div class="result-bins">${bins}</div>
                         </div>
                         <div class="result-meta">
+                            ${langBadge}
                             <span class="version-badge">V${h.version || 0}</span>
                             <span class="score-badge">SCORE ${Number(h.score).toFixed(2)}</span>
                         </div>

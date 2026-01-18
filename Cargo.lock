@@ -198,6 +198,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpp_demangle"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2bb79cb74d735044c972aae58ed0aaa9a837e85b01106a54c39e42e97f62253"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -252,27 +261,40 @@ version = "1.0.0"
 dependencies = [
  "bytes",
  "chrono",
+ "cpp_demangle",
  "http-body-util",
  "hyper",
  "hyper-util",
  "log",
+ "msvc-demangler",
  "native-tls",
  "once_cell",
  "parking_lot 0.12.5",
  "percent-encoding",
  "pretty_env_logger",
  "rand",
+ "rustc-demangle",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "sled",
+ "symbolic-demangle",
  "tantivy",
  "tokio",
  "tokio-native-tls",
  "tokio-rustls",
  "tokio-test",
+]
+
+[[package]]
+name = "debugid"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
+dependencies = [
+ "uuid",
 ]
 
 [[package]]
@@ -757,6 +779,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "744133e4a0e0a658e1374cf3bf8e415c4052a15a111acd372764c55b4177d490"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -771,6 +802,15 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "msvc-demangler"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4c25a3bb7d880e8eceab4822f3141ad0700d20f025991c1f03bd3d00219a5fc"
+dependencies = [
+ "bitflags 2.10.0",
 ]
 
 [[package]]
@@ -1145,6 +1185,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-demangle"
+version = "0.1.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1384,6 +1430,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symbolic-common"
+version = "12.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520cf51c674f8b93d533f80832babe413214bb766b6d7cb74ee99ad2971f8467"
+dependencies = [
+ "debugid",
+ "memmap2 0.9.9",
+ "stable_deref_trait",
+ "uuid",
+]
+
+[[package]]
+name = "symbolic-demangle"
+version = "12.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f0de2ee0ffa2641e17ba715ad51d48b9259778176517979cb38b6aa86fa7425"
+dependencies = [
+ "cc",
+ "cpp_demangle",
+ "msvc-demangler",
+ "rustc-demangle",
+ "symbolic-common",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.114"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1419,7 +1490,7 @@ dependencies = [
  "lru",
  "lz4_flex",
  "measure_time",
- "memmap2",
+ "memmap2 0.7.1",
  "murmurhash32",
  "num_cpus",
  "once_cell",

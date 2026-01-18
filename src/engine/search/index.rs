@@ -173,57 +173,71 @@ impl SearchIndex {
 
     /// Search for functions matching the query.
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
-        if query.trim().is_empty() {
+        let query = query.trim();
+        if query.is_empty() {
             return Ok(Vec::new());
         }
 
         let searcher = self.reader.searcher();
-        let parser = QueryParser::for_index(
-            &self.index,
-            vec![self.fields.func_name, self.fields.binary_name],
-        );
-        let q = parser.parse_query(query).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid search query: {e}"),
-            )
-        })?;
+        let term_lower = query.to_lowercase();
 
-        let top = searcher
-            .search(&q, &TopDocs::with_limit(limit))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("search: {e}")))?;
+        // Brute force search through stored documents
+        // This is less efficient but guaranteed to work
+        let mut hits = Vec::new();
 
-        let mut hits = Vec::with_capacity(top.len());
-        for (score, addr) in top {
-            let doc = searcher
-                .doc(addr)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("doc fetch: {e}")))?;
-            let func_name = doc
-                .get_first(self.fields.func_name)
-                .and_then(|v| v.as_text())
-                .unwrap_or("")
-                .to_string();
-            let key_hex = doc
-                .get_first(self.fields.key_hex)
-                .and_then(|v| v.as_text())
-                .unwrap_or("")
-                .to_string();
-            let mut binary_names = Vec::new();
-            for v in doc.get_all(self.fields.binary_name) {
-                if let Some(t) = v.as_text() {
-                    // Sanitize: extract only the filename to prevent leaking paths/usernames
-                    let sanitized = sanitize_basename(t);
-                    if !sanitized.is_empty() {
-                        binary_names.push(sanitized);
+        for segment_reader in searcher.segment_readers() {
+            let store_reader = segment_reader.get_store_reader(1).map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("store reader: {}", e))
+            })?;
+
+            for doc_id in 0..segment_reader.num_docs() {
+                if let Ok(doc) = store_reader.get(doc_id) {
+                    let func_name = doc
+                        .get_first(self.fields.func_name)
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("");
+
+                    let binary_names: Vec<&str> = doc
+                        .get_all(self.fields.binary_name)
+                        .filter_map(|v| v.as_text())
+                        .collect();
+
+                    let func_lower = func_name.to_lowercase();
+
+                    // Also try matching against demangled name
+                    let demangled = crate::common::demangle::demangle_simple(func_name);
+                    let demangled_lower = demangled.to_lowercase();
+
+                    let matches = func_lower.contains(&term_lower)
+                        || demangled_lower.contains(&term_lower)
+                        || binary_names
+                            .iter()
+                            .any(|b| b.to_lowercase().contains(&term_lower));
+
+                    if matches {
+                        let key_hex = doc
+                            .get_first(self.fields.key_hex)
+                            .and_then(|v| v.as_text())
+                            .unwrap_or("")
+                            .to_string();
+
+                        hits.push(SearchHit::new(
+                            key_hex,
+                            func_name.to_string(),
+                            binary_names
+                                .iter()
+                                .map(|s| sanitize_basename(s))
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            1.0,
+                        ));
+
+                        if hits.len() >= limit {
+                            return Ok(hits);
+                        }
                     }
                 }
             }
-            hits.push(SearchHit {
-                key_hex,
-                func_name,
-                binary_names,
-                score,
-            });
         }
 
         Ok(hits)
