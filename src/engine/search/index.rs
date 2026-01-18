@@ -38,7 +38,7 @@ fn sanitize_basename(input: &str) -> String {
 }
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED};
-use tantivy::tokenizer::{LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer};
+use tantivy::tokenizer::{LowerCaser, RawTokenizer, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
 /// Full-text search index for function metadata.
@@ -195,78 +195,79 @@ impl SearchIndex {
 
     /// Search for functions matching the query. Returns up to `limit` results.
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
-        let query = query.trim();
-        if query.is_empty() {
+        let query_str = query.trim();
+        if query_str.is_empty() {
             return Ok(Vec::new());
         }
 
         let searcher = self.reader.searcher();
-        let term_lower = query.to_lowercase();
-        let mut hits = Vec::with_capacity(limit.min(200));
 
-        for segment_reader in searcher.segment_readers() {
-            let store_reader = segment_reader.get_store_reader(1).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("store reader: {}", e))
-            })?;
+        // Build query parser for all indexed text fields
+        let query_parser = QueryParser::for_index(
+            &self.index,
+            vec![
+                self.fields.func_name,
+                self.fields.func_name_demangled,
+                self.fields.binary_name,
+            ],
+        );
 
-            for doc_id in 0..segment_reader.num_docs() {
-                if let Ok(doc) = store_reader.get(doc_id) {
-                    let func_name = doc
-                        .get_first(self.fields.func_name)
-                        .and_then(|v| v.as_text())
-                        .unwrap_or("");
+        // Parse query - escape special chars and use lenient mode
+        let tantivy_query = query_parser
+            .parse_query_lenient(query_str)
+            .0;
 
-                    let func_name_demangled = doc
-                        .get_first(self.fields.func_name_demangled)
-                        .and_then(|v| v.as_text())
-                        .unwrap_or("");
+        // Execute search using the index
+        let top_docs = searcher
+            .search(&tantivy_query, &TopDocs::with_limit(limit))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("search: {e}")))?;
 
-                    let lang = doc
-                        .get_first(self.fields.lang)
-                        .and_then(|v| v.as_text())
-                        .unwrap_or("");
+        let mut hits = Vec::with_capacity(top_docs.len());
 
-                    let binary_names: Vec<&str> = doc
-                        .get_all(self.fields.binary_name)
-                        .filter_map(|v| v.as_text())
-                        .collect();
+        for (score, doc_addr) in top_docs {
+            let doc = searcher
+                .doc(doc_addr)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("fetch doc: {e}")))?;
 
-                    // Match against mangled name, demangled name, or binary names
-                    let func_lower = func_name.to_lowercase();
-                    let demangled_lower = func_name_demangled.to_lowercase();
+            let key_hex = doc
+                .get_first(self.fields.key_hex)
+                .and_then(|v| v.as_text())
+                .unwrap_or("")
+                .to_string();
 
-                    let matches = func_lower.contains(&term_lower)
-                        || (!demangled_lower.is_empty() && demangled_lower.contains(&term_lower))
-                        || binary_names
-                            .iter()
-                            .any(|b| b.to_lowercase().contains(&term_lower));
+            let func_name = doc
+                .get_first(self.fields.func_name)
+                .and_then(|v| v.as_text())
+                .unwrap_or("")
+                .to_string();
 
-                    if matches {
-                        let key_hex = doc
-                            .get_first(self.fields.key_hex)
-                            .and_then(|v| v.as_text())
-                            .unwrap_or("")
-                            .to_string();
+            let func_name_demangled = doc
+                .get_first(self.fields.func_name_demangled)
+                .and_then(|v| v.as_text())
+                .unwrap_or("")
+                .to_string();
 
-                        hits.push(SearchHit::new_with_demangled(
-                            key_hex,
-                            func_name.to_string(),
-                            func_name_demangled.to_string(),
-                            lang.to_string(),
-                            binary_names
-                                .iter()
-                                .map(|s| sanitize_basename(s))
-                                .filter(|s| !s.is_empty())
-                                .collect(),
-                            1.0,
-                        ));
+            let lang = doc
+                .get_first(self.fields.lang)
+                .and_then(|v| v.as_text())
+                .unwrap_or("")
+                .to_string();
 
-                        if hits.len() >= limit {
-                            return Ok(hits);
-                        }
-                    }
-                }
-            }
+            let binary_names: Vec<String> = doc
+                .get_all(self.fields.binary_name)
+                .filter_map(|v| v.as_text())
+                .map(|s| sanitize_basename(s))
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            hits.push(SearchHit::new_with_demangled(
+                key_hex,
+                func_name,
+                func_name_demangled,
+                lang,
+                binary_names,
+                score,
+            ));
         }
 
         Ok(hits)
@@ -280,11 +281,15 @@ impl SearchIndex {
 
 fn build_schema() -> Schema {
     let mut builder = Schema::builder();
-    let ngram_indexing = TextFieldIndexing::default()
-        .set_tokenizer("edge_ngram")
-        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-    let text_options = TextOptions::default()
-        .set_indexing_options(ngram_indexing.clone())
+
+    // Symbol tokenizer: splits on :: . < > ( ) etc, then lowercases
+    // This turns "gb::crepe::CacheTagParser::EndObject(int)" into
+    // tokens: gb, crepe, cachetagparser, endobject, int
+    let symbol_indexing = TextFieldIndexing::default()
+        .set_tokenizer("symbol")
+        .set_index_option(IndexRecordOption::WithFreqs);
+    let symbol_options = TextOptions::default()
+        .set_indexing_options(symbol_indexing)
         .set_stored();
 
     // Stored-only fields (no indexing, just for retrieval)
@@ -297,24 +302,23 @@ fn build_schema() -> Schema {
     );
 
     builder.add_text_field("key_hex", key_options);
-    builder.add_text_field("func_name", text_options.clone());
-    builder.add_text_field("func_name_demangled", stored_only.clone());
+    builder.add_text_field("func_name", symbol_options.clone());
+    builder.add_text_field("func_name_demangled", symbol_options.clone());
     builder.add_text_field("lang", stored_only);
-    builder.add_text_field("binary_name", text_options);
+    builder.add_text_field("binary_name", symbol_options);
     builder.add_u64_field("ts", STORED);
 
     builder.build()
 }
 
 fn register_tokenizers(index: &Index) {
-    let edge_ngram = TextAnalyzer::builder(
-        NgramTokenizer::new(2, 12, true)
-            .expect("ngram tokenizer should be constructible with default params"),
-    )
-    .filter(LowerCaser)
-    .build();
+    // Symbol tokenizer: SimpleTokenizer splits on non-alphanumeric chars
+    // (handles ::, ., <>, (), etc.), then lowercase for case-insensitive search
+    let symbol = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .build();
     let raw = TextAnalyzer::builder(RawTokenizer::default()).build();
-    index.tokenizers().register("edge_ngram", edge_ngram);
+    index.tokenizers().register("symbol", symbol);
     index.tokenizers().register("raw", raw);
 }
 

@@ -283,25 +283,10 @@ fn list_trees(data_dir: &PathBuf) -> io::Result<()> {
         }
     }
 
-    // Check index_db (contains main index + context trees)
-    let index_db_dir = data_dir.join("index_db");
-    if index_db_dir.exists() {
-        println!("\n--- index_db ---");
-        let db = sled::open(&index_db_dir)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
-        for name in db.tree_names() {
-            let name_str = String::from_utf8_lossy(&name);
-            let tree = db
-                .open_tree(&name)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
-            println!("  {:30} {:>12} entries", name_str, tree.len());
-        }
-    }
-
-    // Also check old-style "index" folder (before rename to index_db)
+    // Check index (main index + context trees) - this is what the server uses
     let index_dir = data_dir.join("index");
     if index_dir.exists() {
-        println!("\n--- index (legacy) ---");
+        println!("\n--- index (server uses this) ---");
         let db = sled::open(&index_dir)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
         for name in db.tree_names() {
@@ -313,12 +298,29 @@ fn list_trees(data_dir: &PathBuf) -> io::Result<()> {
         }
     }
 
+    // Check for orphaned index_db (created by old recover versions)
+    let index_db_dir = data_dir.join("index_db");
+    if index_db_dir.exists() {
+        println!("\n--- index_db (ORPHANED - not used by server) ---");
+        let db = sled::open(&index_db_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
+        for name in db.tree_names() {
+            let name_str = String::from_utf8_lossy(&name);
+            let tree = db
+                .open_tree(&name)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+            println!("  {:30} {:>12} entries", name_str, tree.len());
+        }
+        println!("  WARNING: This directory can be deleted - server uses 'index' not 'index_db'");
+    }
+
     Ok(())
 }
 
 fn rebuild_index(data_dir: &PathBuf) -> io::Result<()> {
     let seg_db_dir = data_dir.join("segments_db");
-    let index_db_dir = data_dir.join("index_db");
+    // Use "index" - same as the server
+    let index_dir = data_dir.join("index");
 
     if !seg_db_dir.exists() {
         eprintln!(
@@ -335,9 +337,10 @@ fn rebuild_index(data_dir: &PathBuf) -> io::Result<()> {
     let seg_db = sled::open(&seg_db_dir)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open segments: {}", e)))?;
 
-    // Open/create the index database
+    // Open/create the index database (same path as server: data/index)
+    std::fs::create_dir_all(&index_dir)?;
     let index_db = sled::Config::default()
-        .path(&index_db_dir)
+        .path(&index_dir)
         .cache_capacity(128 * 1024 * 1024)
         .open()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open index: {}", e)))?;
@@ -472,8 +475,8 @@ fn rebuild_index(data_dir: &PathBuf) -> io::Result<()> {
     index_db.flush()?;
 
     println!("\n\n=== Index Rebuild Complete ===");
-    println!("✓ Indexed {} keys", indexed);
-    println!("✓ Skipped {} deleted keys", deleted);
+    println!("Indexed {} keys", indexed);
+    println!("Skipped {} deleted keys", deleted);
     println!("\nYou can now restart the dazhbog server.");
 
     Ok(())
@@ -530,7 +533,7 @@ fn encode_basenames_for_key(names: &[String]) -> Vec<u8> {
 }
 
 fn rebuild_basenames(data_dir: &PathBuf) -> io::Result<()> {
-    // Server uses "index" folder, not "index_db"
+    // Use "index" - same as the server
     let index_dir = data_dir.join("index");
 
     if !index_dir.exists() {
@@ -646,10 +649,103 @@ fn rebuild_basenames(data_dir: &PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+/// Demangle a symbol name, returning (demangled_name, language) or (original, "")
+fn demangle_symbol(name: &str) -> (String, &'static str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return (name.to_string(), "");
+    }
+
+    // Try Rust
+    if name.starts_with("_R") || name.starts_with("_ZN") || name.starts_with("__RN") {
+        if let Ok(demangled) = rustc_demangle::try_demangle(name) {
+            let mut result = String::new();
+            if std::fmt::Write::write_fmt(&mut result, format_args!("{:#}", demangled)).is_ok() {
+                return (result, "rust");
+            }
+        }
+    }
+
+    // Try MSVC C++
+    if name.starts_with('?') {
+        if let Ok(demangled) =
+            msvc_demangler::demangle(name, msvc_demangler::DemangleFlags::COMPLETE)
+        {
+            return (demangled, "c++/msvc");
+        }
+    }
+
+    // Try Itanium C++ (GCC/Clang)
+    if name.starts_with("_Z") || name.starts_with("__Z") {
+        let to_demangle = if name.starts_with("__Z") {
+            &name[1..]
+        } else {
+            name
+        };
+        if let Ok(sym) = cpp_demangle::Symbol::new(to_demangle) {
+            let mut demangled = String::new();
+            if std::fmt::Write::write_fmt(&mut demangled, format_args!("{}", sym)).is_ok() {
+                return (demangled, "c++");
+            }
+        }
+    }
+
+    // Try Swift
+    if name.starts_with("_$s")
+        || name.starts_with("_$S")
+        || name.starts_with("$s")
+        || name.starts_with("$S")
+        || name.starts_with("_T")
+    {
+        match symbolic_demangle::demangle(name) {
+            std::borrow::Cow::Owned(demangled) if demangled != name => {
+                return (demangled, "swift");
+            }
+            _ => {}
+        }
+    }
+
+    // Try Go
+    if name.contains("·") || name.contains("%c2%b7") {
+        let demangled = name
+            .replace("·", ".")
+            .replace("%c2%b7", ".")
+            .replace("%2e", ".");
+        let demangled = demangled
+            .trim_start_matches("go.")
+            .trim_start_matches("type.")
+            .to_string();
+        if demangled != name {
+            return (demangled, "go");
+        }
+    }
+
+    // Try symbolic as catch-all
+    match symbolic_demangle::demangle(name) {
+        std::borrow::Cow::Owned(demangled) if demangled != name => {
+            let lang = if name.starts_with("_Z") || name.starts_with("__Z") {
+                "c++"
+            } else if name.starts_with('?') {
+                "c++/msvc"
+            } else if name.starts_with("_$") || name.starts_with("$s") {
+                "swift"
+            } else if name.starts_with("_R") {
+                "rust"
+            } else {
+                "unknown"
+            };
+            return (demangled, lang);
+        }
+        _ => {}
+    }
+
+    (name.to_string(), "")
+}
+
 fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     let seg_db_dir = data_dir.join("segments_db");
     let search_dir = data_dir.join("search_index");
-    // Server uses "index" folder, not "index_db"
+    // Use "index" - same as the server
     let index_dir = data_dir.join("index");
 
     if !seg_db_dir.exists() {
@@ -668,7 +764,6 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
         println!("Found index database at {}", index_dir.display());
         let index_db = sled::open(&index_dir)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open index: {}", e)))?;
-        // Context trees use "ctx." prefix in the index database
         match index_db.open_tree("ctx.key_basenames") {
             Ok(tree) => {
                 println!("  Opened ctx.key_basenames tree ({} entries)", tree.len());
@@ -718,7 +813,7 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
         println!("Scanning {} ({} records)...", name, tree.len());
 
         for item in tree.iter() {
-            let (offset_bytes, record_bytes) = match item {
+            let (_, record_bytes) = match item {
                 Ok(i) => i,
                 Err(_) => continue,
             };
@@ -795,18 +890,26 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     std::fs::create_dir_all(&search_dir)?;
 
     // Use tantivy directly for indexing
+    // IMPORTANT: Schema must match src/engine/search/index.rs exactly!
     use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED};
-    use tantivy::tokenizer::{LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer};
+    use tantivy::tokenizer::{LowerCaser, RawTokenizer, SimpleTokenizer, TextAnalyzer};
     use tantivy::{Index, IndexWriter};
 
-    // Build schema (must match SearchIndex::build_schema)
+    // Build schema - must match SearchIndex::build_schema in src/engine/search/index.rs
     let mut builder = Schema::builder();
-    let ngram_indexing = TextFieldIndexing::default()
-        .set_tokenizer("edge_ngram")
-        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-    let text_options = TextOptions::default()
-        .set_indexing_options(ngram_indexing.clone())
+
+    // Symbol tokenizer options (splits on non-alphanumeric, lowercases)
+    let symbol_indexing = TextFieldIndexing::default()
+        .set_tokenizer("symbol")
+        .set_index_option(IndexRecordOption::WithFreqs);
+    let symbol_options = TextOptions::default()
+        .set_indexing_options(symbol_indexing)
         .set_stored();
+
+    // Stored-only (no indexing)
+    let stored_only = TextOptions::default().set_stored();
+
+    // Raw tokenizer for exact key matching
     let key_options = TextOptions::default().set_stored().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer("raw")
@@ -814,25 +917,27 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     );
 
     let key_hex = builder.add_text_field("key_hex", key_options);
-    let func_name = builder.add_text_field("func_name", text_options.clone());
-    let _binary_name = builder.add_text_field("binary_name", text_options);
+    let func_name = builder.add_text_field("func_name", symbol_options.clone());
+    let func_name_demangled = builder.add_text_field("func_name_demangled", symbol_options.clone());
+    let lang = builder.add_text_field("lang", stored_only);
+    let binary_name = builder.add_text_field("binary_name", symbol_options);
     let ts = builder.add_u64_field("ts", STORED);
+
     let schema = builder.build();
 
     // Create index
     let index = Index::create_in_dir(&search_dir, schema)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("create index: {}", e)))?;
 
-    // Register tokenizers
-    let edge_ngram =
-        TextAnalyzer::builder(NgramTokenizer::new(2, 12, true).expect("ngram tokenizer"))
-            .filter(LowerCaser)
-            .build();
+    // Register tokenizers - must match src/engine/search/index.rs
+    let symbol = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .build();
     let raw = TextAnalyzer::builder(RawTokenizer::default()).build();
-    index.tokenizers().register("edge_ngram", edge_ngram);
+    index.tokenizers().register("symbol", symbol);
     index.tokenizers().register("raw", raw);
 
-    // Create writer
+    // Create writer with 50MB heap
     let mut writer: IndexWriter = index
         .writer(50_000_000)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("writer: {}", e)))?;
@@ -840,12 +945,28 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     println!("\nIndexing {} functions...", latest_by_key.len());
     let mut indexed = 0u64;
     let mut with_basenames = 0u64;
+    let mut demangled_count = 0u64;
 
     for (k, (ts_val, name)) in latest_by_key.iter() {
         let key_hex_str = format!("{:032x}", k);
+
+        // Demangle the function name
+        let (demangled_name, lang_str) = demangle_symbol(name);
+        let is_demangled = !lang_str.is_empty() && demangled_name != *name;
+
         let mut doc = tantivy::Document::new();
         doc.add_text(key_hex, &key_hex_str);
         doc.add_text(func_name, name);
+
+        if is_demangled {
+            doc.add_text(func_name_demangled, &demangled_name);
+            doc.add_text(lang, lang_str);
+            demangled_count += 1;
+        } else {
+            doc.add_text(func_name_demangled, "");
+            doc.add_text(lang, "");
+        }
+
         doc.add_u64(ts, *ts_val);
 
         // Look up binary names from context database
@@ -853,12 +974,10 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
             let key_bytes = k.to_le_bytes();
             if let Ok(Some(val)) = tree.get(&key_bytes) {
                 if let Some(basenames) = decode_basenames(&val) {
-                    if !basenames.is_empty() {
-                        // Join basenames with space for search indexing
-                        let binary_names_str = basenames.join(" ");
-                        doc.add_text(_binary_name, &binary_names_str);
-                        with_basenames += 1;
+                    for bn in basenames {
+                        doc.add_text(binary_name, &bn);
                     }
+                    with_basenames += 1;
                 }
             }
         }
@@ -870,15 +989,15 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
         indexed += 1;
         if indexed % 10000 == 0 {
             print!(
-                "\r  Indexed {} functions ({} with binaries)...",
-                indexed, with_basenames
+                "\r  Indexed {} functions ({} demangled, {} with binaries)...",
+                indexed, demangled_count, with_basenames
             );
         }
     }
 
     println!(
-        "\r  Indexed {} functions ({} with binaries)",
-        indexed, with_basenames
+        "\r  Indexed {} functions ({} demangled, {} with binaries)",
+        indexed, demangled_count, with_basenames
     );
     println!("\nCommitting...");
     writer
@@ -887,6 +1006,7 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
 
     println!("\n=== Search Index Rebuild Complete ===");
     println!("  Indexed {} functions", indexed);
+    println!("  {} functions demangled", demangled_count);
     println!("  {} functions have binary names", with_basenames);
     println!("\nYou can now restart the dazhbog server.");
 
@@ -1057,9 +1177,9 @@ fn main() -> io::Result<()> {
     );
 
     println!("\n=== Recovery Complete ===");
-    println!("✓ Recovered {} unique records", final_records.len());
-    println!("✓ Old segments backed up to: {}", backup_dir.display());
-    println!("✓ New segments ready at: {}", data_dir.display());
+    println!("Recovered {} unique records", final_records.len());
+    println!("Old segments backed up to: {}", backup_dir.display());
+    println!("New segments ready at: {}", data_dir.display());
     println!("\nYou can now restart the dazhbog server.");
 
     Ok(())
