@@ -254,12 +254,14 @@ fn print_usage() {
     eprintln!("Usage: recover [COMMAND] [OPTIONS]");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  --rebuild-index [DATA_DIR]   Rebuild the key->addr index from segment data");
-    eprintln!("  --rebuild-search [DATA_DIR]  Rebuild the full-text search index");
-    eprintln!("  --rebuild-basenames [DATA_DIR]  Populate ctx.key_basenames from ctx.binary_meta");
-    eprintln!("  --full-recover [DATA_DIR]    Full recovery with deduplication");
-    eprintln!("  --list-trees [DATA_DIR]      List all sled trees and their sizes");
-    eprintln!("  --help                       Show this help message");
+    eprintln!("  --migrate-context [DATA_DIR]    Migrate context trees from index to context_db");
+    eprintln!("  --rebuild-index [DATA_DIR]      Rebuild the key->addr index from segment data");
+    eprintln!("  --rebuild-search [DATA_DIR]     Rebuild the full-text search index");
+    eprintln!("  --rebuild-basenames [DATA_DIR]  Populate key_basenames from binary_meta");
+    eprintln!("  --rebuild-all [DATA_DIR]        Migrate context + rebuild index + rebuild search");
+    eprintln!("  --full-recover [DATA_DIR]       Full recovery with deduplication");
+    eprintln!("  --list-trees [DATA_DIR]         List all sled trees and their sizes");
+    eprintln!("  --help                          Show this help message");
     eprintln!();
     eprintln!("Default DATA_DIR is 'data/'");
 }
@@ -271,7 +273,7 @@ fn list_trees(data_dir: &PathBuf) -> io::Result<()> {
     // Check segments_db
     let seg_db_dir = data_dir.join("segments_db");
     if seg_db_dir.exists() {
-        println!("\n--- segments_db ---");
+        println!("\n--- segments_db (raw records) ---");
         let db = sled::open(&seg_db_dir)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
         for name in db.tree_names() {
@@ -283,11 +285,53 @@ fn list_trees(data_dir: &PathBuf) -> io::Result<()> {
         }
     }
 
-    // Check index (main index + context trees) - this is what the server uses
+    // Check index (key->addr mapping only)
     let index_dir = data_dir.join("index");
     if index_dir.exists() {
-        println!("\n--- index (server uses this) ---");
+        println!("\n--- index (key->addr mapping) ---");
         let db = sled::open(&index_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
+        let mut has_ctx_trees = false;
+        for name in db.tree_names() {
+            let name_str = String::from_utf8_lossy(&name);
+            let tree = db
+                .open_tree(&name)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+            if name_str.starts_with("ctx.") {
+                has_ctx_trees = true;
+                println!("  {:30} {:>12} entries (NEEDS MIGRATION)", name_str, tree.len());
+            } else {
+                println!("  {:30} {:>12} entries", name_str, tree.len());
+            }
+        }
+        if has_ctx_trees {
+            println!("  WARNING: ctx.* trees found - run --migrate-context to move to context_db");
+        }
+    }
+
+    // Check context_db (isolated context index)
+    let ctx_db_dir = data_dir.join("context_db");
+    if ctx_db_dir.exists() {
+        println!("\n--- context_db (binary/function metadata) ---");
+        let db = sled::open(&ctx_db_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
+        for name in db.tree_names() {
+            let name_str = String::from_utf8_lossy(&name);
+            let tree = db
+                .open_tree(&name)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+            println!("  {:30} {:>12} entries", name_str, tree.len());
+        }
+    } else {
+        println!("\n--- context_db (NOT FOUND) ---");
+        println!("  Run --migrate-context to create from old index/ctx.* trees");
+    }
+
+    // Check for orphaned index_db (created by old recover versions)
+    let index_db_dir = data_dir.join("index_db");
+    if index_db_dir.exists() {
+        println!("\n--- index_db (ORPHANED - can be deleted) ---");
+        let db = sled::open(&index_db_dir)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
         for name in db.tree_names() {
             let name_str = String::from_utf8_lossy(&name);
@@ -298,21 +342,121 @@ fn list_trees(data_dir: &PathBuf) -> io::Result<()> {
         }
     }
 
-    // Check for orphaned index_db (created by old recover versions)
-    let index_db_dir = data_dir.join("index_db");
-    if index_db_dir.exists() {
-        println!("\n--- index_db (ORPHANED - not used by server) ---");
-        let db = sled::open(&index_db_dir)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open: {}", e)))?;
-        for name in db.tree_names() {
-            let name_str = String::from_utf8_lossy(&name);
-            let tree = db
-                .open_tree(&name)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
-            println!("  {:30} {:>12} entries", name_str, tree.len());
-        }
-        println!("  WARNING: This directory can be deleted - server uses 'index' not 'index_db'");
+    // Check search_index
+    let search_dir = data_dir.join("search_index");
+    if search_dir.exists() {
+        println!("\n--- search_index (Tantivy) ---");
+        println!("  (Full-text search index exists)");
     }
+
+    Ok(())
+}
+
+fn migrate_context(data_dir: &PathBuf) -> io::Result<()> {
+    let index_dir = data_dir.join("index");
+    let ctx_db_dir = data_dir.join("context_db");
+
+    println!("=== Dazhbog Context Migration Tool ===\n");
+    println!("Data directory: {}", data_dir.display());
+
+    // Check if context_db already exists
+    if ctx_db_dir.exists() {
+        println!("\ncontext_db already exists at {}", ctx_db_dir.display());
+        println!("If you want to re-migrate, delete it first: rm -rf {}", ctx_db_dir.display());
+        return Ok(());
+    }
+
+    // Check if source index exists
+    if !index_dir.exists() {
+        eprintln!("Error: {}/index directory not found.", data_dir.display());
+        std::process::exit(1);
+    }
+
+    // Open source index db
+    let src_db = sled::open(&index_dir)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open index: {}", e)))?;
+
+    // Check for ctx.* trees
+    let ctx_tree_names: Vec<String> = src_db
+        .tree_names()
+        .into_iter()
+        .map(|n| String::from_utf8_lossy(&n).to_string())
+        .filter(|n| n.starts_with("ctx."))
+        .collect();
+
+    if ctx_tree_names.is_empty() {
+        println!("\nNo ctx.* trees found in index.");
+        println!("Creating empty context_db...");
+        std::fs::create_dir_all(&ctx_db_dir)?;
+        let dst_db = sled::open(&ctx_db_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open context_db: {}", e)))?;
+        // Create empty trees
+        for name in &["key_md5", "key_bins", "version_stats", "binary_meta", "key_basenames"] {
+            dst_db.open_tree(name)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+        }
+        dst_db.flush()?;
+        println!("\n=== Migration Complete ===");
+        println!("Created empty context_db at {}", ctx_db_dir.display());
+        return Ok(());
+    }
+
+    println!("\nFound {} context trees to migrate:", ctx_tree_names.len());
+    for name in &ctx_tree_names {
+        let tree = src_db.open_tree(name)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+        println!("  {} ({} entries)", name, tree.len());
+    }
+
+    // Create destination context_db
+    std::fs::create_dir_all(&ctx_db_dir)?;
+    let dst_db = sled::Config::default()
+        .path(&ctx_db_dir)
+        .cache_capacity(64 * 1024 * 1024)
+        .open()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open context_db: {}", e)))?;
+
+    // Migrate each tree (stripping "ctx." prefix)
+    println!("\nMigrating...");
+    for src_name in &ctx_tree_names {
+        let dst_name = src_name.strip_prefix("ctx.").unwrap_or(src_name);
+        let src_tree = src_db.open_tree(src_name)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+        let dst_tree = dst_db.open_tree(dst_name)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {}", e)))?;
+
+        let count = src_tree.len();
+        let mut migrated = 0u64;
+
+        for item in src_tree.iter() {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            dst_tree.insert(&k, &v)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("insert: {}", e)))?;
+            migrated += 1;
+            if migrated % 100000 == 0 {
+                print!("\r  {} -> {}: {}/{} entries...", src_name, dst_name, migrated, count);
+            }
+        }
+        println!("\r  {} -> {}: {} entries migrated    ", src_name, dst_name, migrated);
+    }
+
+    dst_db.flush()?;
+
+    // Remove ctx.* trees from source index
+    println!("\nRemoving ctx.* trees from index...");
+    for name in &ctx_tree_names {
+        src_db.drop_tree(name.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("drop_tree: {}", e)))?;
+        println!("  Dropped {}", name);
+    }
+    src_db.flush()?;
+
+    println!("\n=== Migration Complete ===");
+    println!("Context data moved to {}", ctx_db_dir.display());
+    println!("The server will now use context_db for all context operations.");
 
     Ok(())
 }
@@ -533,38 +677,39 @@ fn encode_basenames_for_key(names: &[String]) -> Vec<u8> {
 }
 
 fn rebuild_basenames(data_dir: &PathBuf) -> io::Result<()> {
-    // Use "index" - same as the server
-    let index_dir = data_dir.join("index");
+    // Use context_db (isolated context database)
+    let ctx_db_dir = data_dir.join("context_db");
 
-    if !index_dir.exists() {
-        eprintln!("Error: {}/index directory not found.", data_dir.display());
+    if !ctx_db_dir.exists() {
+        eprintln!("Error: {}/context_db directory not found.", data_dir.display());
+        eprintln!("Run --migrate-context first to create it.");
         std::process::exit(1);
     }
 
     println!("=== Dazhbog Basenames Rebuild Tool ===\n");
     println!("Data directory: {}", data_dir.display());
 
-    let db = sled::open(&index_dir)
+    let db = sled::open(&ctx_db_dir)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open: {}", e)))?;
 
-    // Open required trees
+    // Open required trees (no "ctx." prefix in context_db)
     let key_bins = db
-        .open_tree("ctx.key_bins")
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open ctx.key_bins: {}", e)))?;
-    let binary_meta = db.open_tree("ctx.binary_meta").map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("open ctx.binary_meta: {}", e))
+        .open_tree("key_bins")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open key_bins: {}", e)))?;
+    let binary_meta = db.open_tree("binary_meta").map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("open binary_meta: {}", e))
     })?;
-    let key_basenames = db.open_tree("ctx.key_basenames").map_err(|e| {
+    let key_basenames = db.open_tree("key_basenames").map_err(|e| {
         io::Error::new(
             io::ErrorKind::Other,
-            format!("open ctx.key_basenames: {}", e),
+            format!("open key_basenames: {}", e),
         )
     })?;
 
-    println!("ctx.key_bins:      {} entries", key_bins.len());
-    println!("ctx.binary_meta:   {} entries", binary_meta.len());
+    println!("key_bins:      {} entries", key_bins.len());
+    println!("binary_meta:   {} entries", binary_meta.len());
     println!(
-        "ctx.key_basenames: {} entries (before)",
+        "key_basenames: {} entries (before)",
         key_basenames.len()
     );
 
@@ -590,7 +735,7 @@ fn rebuild_basenames(data_dir: &PathBuf) -> io::Result<()> {
     println!("  Found {} binaries with basenames", md5_to_basename.len());
 
     // Iterate key_bins and populate key_basenames
-    println!("\nPopulating ctx.key_basenames...");
+    println!("\nPopulating key_basenames...");
     let mut processed = 0u64;
     let mut populated = 0u64;
 
@@ -640,7 +785,7 @@ fn rebuild_basenames(data_dir: &PathBuf) -> io::Result<()> {
         processed, populated
     );
     println!(
-        "\nctx.key_basenames: {} entries (after)",
+        "\nkey_basenames: {} entries (after)",
         key_basenames.len()
     );
     println!("\n=== Basenames Rebuild Complete ===");
@@ -745,8 +890,8 @@ fn demangle_symbol(name: &str) -> (String, &'static str) {
 fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     let seg_db_dir = data_dir.join("segments_db");
     let search_dir = data_dir.join("search_index");
-    // Use "index" - same as the server
-    let index_dir = data_dir.join("index");
+    // Use context_db for basenames (isolated context database)
+    let ctx_db_dir = data_dir.join("context_db");
 
     if !seg_db_dir.exists() {
         eprintln!(
@@ -759,17 +904,17 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     println!("=== Dazhbog Search Index Rebuild Tool ===\n");
     println!("Data directory: {}", data_dir.display());
 
-    // Open index database for context (binary names are stored in ctx.key_basenames tree)
-    let ctx_basenames_tree: Option<sled::Tree> = if index_dir.exists() {
-        println!("Found index database at {}", index_dir.display());
-        let index_db = sled::open(&index_dir)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open index: {}", e)))?;
-        match index_db.open_tree("ctx.key_basenames") {
+    // Open context database for basenames (key_basenames tree)
+    let ctx_basenames_tree: Option<sled::Tree> = if ctx_db_dir.exists() {
+        println!("Found context_db at {}", ctx_db_dir.display());
+        let ctx_db = sled::open(&ctx_db_dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled open context_db: {}", e)))?;
+        match ctx_db.open_tree("key_basenames") {
             Ok(tree) => {
-                println!("  Opened ctx.key_basenames tree ({} entries)", tree.len());
+                println!("  Opened key_basenames tree ({} entries)", tree.len());
                 if tree.is_empty() {
                     println!(
-                        "  Warning: ctx.key_basenames is empty, run --rebuild-basenames first"
+                        "  Warning: key_basenames is empty, run --rebuild-basenames first"
                     );
                     None
                 } else {
@@ -777,12 +922,13 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("  Warning: could not open ctx.key_basenames: {}", e);
+                eprintln!("  Warning: could not open key_basenames: {}", e);
                 None
             }
         }
     } else {
-        println!("No index database found, binary names will be empty");
+        println!("No context_db found, binary names will be empty");
+        println!("  Run --migrate-context first to create context_db");
         None
     };
 
@@ -1013,6 +1159,41 @@ fn rebuild_search(data_dir: &PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+/// Combined command: migrate context + rebuild index + rebuild search
+fn rebuild_all(data_dir: &PathBuf) -> io::Result<()> {
+    println!("=== Dazhbog Full Rebuild ===\n");
+    println!("This will run the following steps:");
+    println!("  1. Migrate context trees from index to context_db");
+    println!("  2. Rebuild key->addr index from segments");
+    println!("  3. Rebuild full-text search index");
+    println!();
+
+    // Step 1: Migrate context
+    println!("========================================");
+    println!("STEP 1: Migrate Context");
+    println!("========================================\n");
+    migrate_context(data_dir)?;
+
+    // Step 2: Rebuild index
+    println!("\n========================================");
+    println!("STEP 2: Rebuild Index");
+    println!("========================================\n");
+    rebuild_index(data_dir)?;
+
+    // Step 3: Rebuild search
+    println!("\n========================================");
+    println!("STEP 3: Rebuild Search Index");
+    println!("========================================\n");
+    rebuild_search(data_dir)?;
+
+    println!("\n========================================");
+    println!("=== Full Rebuild Complete ===");
+    println!("========================================");
+    println!("\nAll databases have been rebuilt. You can now start the server.");
+
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -1028,6 +1209,9 @@ fn main() -> io::Result<()> {
             print_usage();
             return Ok(());
         }
+        Some("--migrate-context") => {
+            return migrate_context(&data_path);
+        }
         Some("--rebuild-index") => {
             return rebuild_index(&data_path);
         }
@@ -1036,6 +1220,9 @@ fn main() -> io::Result<()> {
         }
         Some("--rebuild-basenames") => {
             return rebuild_basenames(&data_path);
+        }
+        Some("--rebuild-all") => {
+            return rebuild_all(&data_path);
         }
         Some("--list-trees") => {
             return list_trees(&data_path);

@@ -61,7 +61,9 @@ impl EngineRuntime {
             segments.rebuild_index(&index)?;
         }
 
-        let ctx_index = Arc::new(ContextIndex::new(&index_db)?);
+        // context_db is separate - crashes if not found (run `recover --migrate-context` first)
+        let ctx_index = Arc::new(ContextIndex::open(&dir)?);
+
         let search_dir = dir.join("search_index");
         let search = Arc::new(SearchIndex::open(&search_dir)?);
         if search.is_empty()? {

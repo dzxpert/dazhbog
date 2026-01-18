@@ -34,6 +34,8 @@ pub struct VersionStats {
 }
 
 pub struct ContextIndex {
+    #[allow(dead_code)]
+    db: sled::Db, // Keep db handle alive
     t_key_md5: sled::Tree,       // key||md5 -> KeyMd5Stats
     t_key_bins: sled::Tree,      // key -> Vec<KeyMd5Entry>
     t_version_stats: sled::Tree, // version_id -> VersionStats
@@ -46,25 +48,66 @@ const MAX_MD5_PER_VERSION: usize = 16;
 const MAX_BASENAMES_PER_KEY: usize = 16;
 
 impl ContextIndex {
-    pub fn new(db: &sled::Db) -> io::Result<Self> {
-        debug!("initializing context index");
+    /// Open existing context_db. Crashes if it doesn't exist.
+    /// Use `recover --migrate-context` to create it from old data.
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        let ctx_dir = dir.join("context_db");
+        if !ctx_dir.exists() {
+            error!("context_db not found at {}", ctx_dir.display());
+            error!("Run `recover --migrate-context` to migrate from old index format");
+            panic!(
+                "FATAL: context_db not found at {}. Run `recover --migrate-context` first.",
+                ctx_dir.display()
+            );
+        }
+        Self::open_internal(&ctx_dir)
+    }
+
+    /// Open or create context_db (for recover tool).
+    pub fn open_or_create(dir: &Path) -> io::Result<Self> {
+        let ctx_dir = dir.join("context_db");
+        std::fs::create_dir_all(&ctx_dir)?;
+        Self::open_internal(&ctx_dir)
+    }
+
+    /// Open context_db directly at the given path (for recover tool migration).
+    pub fn open_at_path(ctx_dir: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(ctx_dir)?;
+        Self::open_internal(ctx_dir)
+    }
+
+    fn open_internal(ctx_dir: &Path) -> io::Result<Self> {
+        debug!("opening context index at {}", ctx_dir.display());
+        let db = sled::Config::default()
+            .path(ctx_dir)
+            .cache_capacity(32 * 1024 * 1024)
+            .flush_every_ms(Some(500))
+            .open()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("sled open context_db: {e}"),
+                )
+            })?;
+
         let t_key_md5 = db
-            .open_tree("ctx.key_md5")
+            .open_tree("key_md5")
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {e}")));
         let t_key_bins = db
-            .open_tree("ctx.key_bins")
+            .open_tree("key_bins")
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {e}")));
         let t_version_stats = db
-            .open_tree("ctx.version_stats")
+            .open_tree("version_stats")
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {e}")));
         let t_binary_meta = db
-            .open_tree("ctx.binary_meta")
+            .open_tree("binary_meta")
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {e}")));
         let t_key_basenames = db
-            .open_tree("ctx.key_basenames")
+            .open_tree("key_basenames")
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open_tree: {e}")));
         info!("context index initialized successfully");
         Ok(Self {
+            db,
             t_key_md5: t_key_md5?,
             t_key_bins: t_key_bins?,
             t_version_stats: t_version_stats?,
