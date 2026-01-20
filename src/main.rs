@@ -21,7 +21,7 @@ fn setup_logger() {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", concat!(env!("CARGO_PKG_NAME"), "=debug"));
     }
-    pretty_env_logger::init_timed();
+    env_logger::init();
 }
 
 fn print_help() {

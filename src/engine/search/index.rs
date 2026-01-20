@@ -108,7 +108,7 @@ impl SearchIndex {
     /// Call `commit()` after indexing a batch of documents.
     pub fn index_function_no_commit(&self, doc: &SearchDocument) -> io::Result<()> {
         let key_hex = format!("{:032x}", doc.key);
-        let mut writer = self.writer.lock();
+        let writer = self.writer.lock();
         writer.delete_term(Term::from_field_text(self.fields.key_hex, &key_hex));
 
         let mut tdoc = tantivy::Document::new();

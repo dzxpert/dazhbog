@@ -1,9 +1,6 @@
-#[cfg(windows)]
-use std::os::windows::fs::FileExt as _;
 use std::{
     fs::OpenOptions,
-    io,
-    os::unix::fs::FileExt,
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -282,7 +279,7 @@ fn migrate_dat_files_to_sled(dat_files: &[PathBuf], db: &sled::Db, _dir: &Path) 
 
         log::info!("Migrating segment {} from {}", seg_id, file_name);
 
-        let file = OpenOptions::new().read(true).open(path)?;
+        let mut file = OpenOptions::new().read(true).open(path)?;
         let file_len = file.metadata()?.len();
 
         let tree_name = format!("seg.{:05}", seg_id);
@@ -295,7 +292,10 @@ fn migrate_dat_files_to_sled(dat_files: &[PathBuf], db: &sled::Db, _dir: &Path) 
 
         while offset + 12 < file_len {
             let mut hdr = [0u8; 12];
-            if file.read_exact_at(&mut hdr, offset).is_err() {
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                break;
+            }
+            if file.read_exact(&mut hdr).is_err() {
                 break;
             }
 
@@ -311,7 +311,8 @@ fn migrate_dat_files_to_sled(dat_files: &[PathBuf], db: &sled::Db, _dir: &Path) 
             }
 
             let mut record_data = vec![0u8; rec_len as usize];
-            file.read_exact_at(&mut record_data, offset)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut record_data)?;
 
             tree.insert(offset_key(offset), record_data.as_slice())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sled insert: {e}")))?;
