@@ -237,6 +237,9 @@ upstream.1.port = 1235
 
 Run `./dazhbog --help` for a complete list of configuration options.
 
+> **Note**: Some TOML parsers don't support inline comments on value lines (e.g., `key = value  # comment`).
+> If you encounter parsing errors, move comments to separate lines above the values.
+
 **Example `config.toml`:**
 
 ```toml
